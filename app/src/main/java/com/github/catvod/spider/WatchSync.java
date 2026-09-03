@@ -515,11 +515,27 @@ public class WatchSync {
             long now = System.currentTimeMillis();
             Map<String, Long> myTombs = new HashMap<>();
 
-            // 本地上次有、当前没有 → 立即生成墓碑（不再延迟确认）
+            // 本地上次有、当前视图没有 → 先用 findByName 直查库确认真的删了才生成墓碑。
+            // 因为 localHistoryFull() 可能退化为 History.get()（按当前源 cid 过滤+取近N条），
+            // 来回切换源/zengge98,zengge99 时它会瞬时满空集/数量缴变，但记录其实还在库里。
+            // 用 findByName 打库：库里还有 → 只是换源瞬时视图问题，不打墓碑；库里确认没了 → 才打。
             for (String n : localSnap) {
-                if (!currentLocal.contains(n)) {
+                if (currentLocal.contains(n)) continue;
+                boolean stillInDb = false;
+                try {
+                    Object found = historyFindByName.invoke(null, n);
+                    if (found instanceof List && !((List<?>) found).isEmpty()) {
+                        stillInDb = true;
+                    }
+                } catch (Throwable t) {
+                    Logger.log("WatchSync > findByName 校验异常，保守视为已删除: " + n + " err=" + t);
+                    stillInDb = false;
+                }
+                if (stillInDb) {
+                    Logger.log("WatchSync > 记录仍在库中（换源瞬时视图为空，非真正删除），不生成墓碑: " + n);
+                } else {
                     myTombs.put(n, now);
-                    Logger.log("WatchSync > 检测到删除，立即生成墓碑: " + n);
+                    Logger.log("WatchSync > 检测到删除（findByName 确认库中已无该记录），生成墓碑: " + n);
                 }
             }
 

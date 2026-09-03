@@ -109,6 +109,8 @@ public class WatchSync {
     private Method vodGetCid;               // 候选1: VodConfig.getCid() -> 当前播放源 id
     private Method vodConfigVod;            // 候选2: Config.vod() -> 当前 vod 配置实例（OK影视等魔改壳）
     private Method configGetId;             // 候选2: Config.getId() -> 配置实例的 id
+    private Method configGetUrl;            // 诊断: Config.getUrl() -> 源配置 url（跨设备稳定候选）
+    private Method configGetName;           // 诊断: Config.getName() -> 源配置 name
 
     /** 远端解析结果。 */
     private static class RemoteData {
@@ -377,11 +379,23 @@ public class WatchSync {
             Class<?> cfg = Class.forName(appPkg + ".bean.Config");
             vodConfigVod = cfg.getMethod("vod");
             configGetId = cfg.getMethod("getId");
+            try {
+                configGetUrl = cfg.getMethod("getUrl");
+            } catch (Throwable t) {
+                configGetUrl = null;
+            }
+            try {
+                configGetName = cfg.getMethod("getName");
+            } catch (Throwable t) {
+                configGetName = null;
+            }
             Logger.log("WatchSync > 候选2 Config.vod().getId() 反射成功: className=" + cfg.getName() + " vod=" + vodConfigVod
-                    + " getId=" + configGetId);
+                    + " getId=" + configGetId + " getUrl=" + (configGetUrl != null) + " getName=" + (configGetName != null));
         } catch (Throwable t) {
             vodConfigVod = null;
             configGetId = null;
+            configGetUrl = null;
+            configGetName = null;
             Logger.log("WatchSync > 候选2 Config.vod().getId() 反射失败: " + t);
         }
         // 本实例锁定 cid 已由 start(cid) 传入（构造函数中 alistCid=cid），此处不再读取 currentCid() 覆盖
@@ -461,14 +475,53 @@ public class WatchSync {
 
     /**
      * 注册周期任务：
-     *   - 0.5 秒 cid 探针（监控 cid 变化，变化时进入抑制并清快照）；
-     *   - 本地 3 秒轮询（本机记录变化触发同步）；
-     *   - 定时 30 秒拉取远端（统一走 pullAndPush）。
+     *   - 0.5 秒语义源诊断（dump cid/url/name/history 数量等，用于选分区键）；
+     *   - 0.5 秒 cid 探针（兜底停机）；
+     *   - 本地 3 秒轮询；
+     *   - 定时 30 秒拉取远端。
+     * 注：诊断探针为临时排查用，定案后移除或降频。
      */
     private void schedule() {
+        scheduler.scheduleWithFixedDelay(this::diagProbe, CID_PROBE_MS, CID_PROBE_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(this::monitorCid, CID_PROBE_MS, CID_PROBE_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(this::pollLocal, PUSH_POLL_MS, PUSH_POLL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(() -> pullAndPush(), PULL_PERIOD_SEC, PULL_PERIOD_SEC, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 诊断探针（临时）：每 0.5s 把当前可拿到的宿主信息 dump 出来，用于判断哪个字段适合做同步分区键。
+     */
+    private void diagProbe() {
+        try {
+            StringBuilder sb = new StringBuilder();
+            int cid = currentCid();
+            sb.append("cid=").append(cid);
+            if (vodConfigVod != null) {
+                try {
+                    Object cfg = vodConfigVod.invoke(null);
+                    if (cfg != null) {
+                        if (configGetId != null) sb.append(" cfgId=").append(configGetId.invoke(cfg));
+                        if (configGetUrl != null) sb.append(" cfgUrl=").append(configGetUrl.invoke(cfg));
+                        if (configGetName != null) sb.append(" cfgName=").append(configGetName.invoke(cfg));
+                    } else {
+                        sb.append(" cfg=null");
+                    }
+                } catch (Throwable t) {
+                    sb.append(" cfgErr=").append(t.getClass().getSimpleName());
+                }
+            }
+            if (historyGet != null) {
+                try {
+                    Object list = historyGet.invoke(null);
+                    sb.append(" histGet=").append(list instanceof List ? ((List<?>) list).size() : "na");
+                } catch (Throwable t) {
+                    sb.append(" histGetErr");
+                }
+            }
+            Logger.log("WatchSync > [diag] " + sb);
+        } catch (Throwable t) {
+            Logger.log("WatchSync > [diag] err: " + t);
+        }
     }
 
     /**

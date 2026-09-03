@@ -733,6 +733,17 @@ public class WatchSync {
                 Logger.log("WatchSync > SQLite 直读失败：库文件不存在 " + (dbf == null ? "null" : dbf.getPath()));
                 return localHistoryFallback();
             }
+            // 收集 History bean 里 boolean 类型的字段：Room 把 boolean 存成 INTEGER(0/1)，
+            // 喂给 Gson objectFrom 时必须转成 true/false，否则数字 token 反序列化到 boolean 会抛 JsonSyntaxException。
+            Set<String> boolFields = new java.util.HashSet<>();
+            try {
+                for (Field f : historyClass.getDeclaredFields()) {
+                    if (f.getType() == boolean.class) boolFields.add(f.getName());
+                }
+                Logger.log("WatchSync > SQLite 直读 boolean 字段: " + boolFields);
+            } catch (Throwable t) {
+                Logger.log("WatchSync > SQLite 直读 反射 boolean 字段失败: " + t);
+            }
             db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READONLY);
             cur = db.rawQuery("SELECT * FROM History", null);
             String[] cols = cur.getColumnNames();
@@ -747,7 +758,11 @@ public class WatchSync {
                         if (t == Cursor.FIELD_TYPE_STRING) {
                             j.put(col, cur.getString(idx));
                         } else if (t == Cursor.FIELD_TYPE_INTEGER) {
-                            j.put(col, cur.getLong(idx));
+                            if (boolFields.contains(col)) {
+                                j.put(col, cur.getInt(idx) != 0);   // 真布尔 true/false
+                            } else {
+                                j.put(col, cur.getLong(idx));
+                            }
                         } else if (t == Cursor.FIELD_TYPE_FLOAT) {
                             j.put(col, cur.getDouble(idx));
                         } else if (t == Cursor.FIELD_TYPE_BLOB) {
@@ -760,13 +775,15 @@ public class WatchSync {
                     Object obj = historyObjectFrom.invoke(null, j.toString());
                     if (obj != null) out.add(obj);
                 } catch (Throwable t) {
-                    Logger.log("WatchSync > SQLite 直读 objectFrom 失败，跳过一行: " + t);
+                    Throwable c = t;
+                    while (c instanceof java.lang.reflect.InvocationTargetException && c.getCause() != null) c = c.getCause();
+                    Logger.log("WatchSync > SQLite 直读 objectFrom 失败，跳过一行: " + c);
                 }
             }
             Logger.log("WatchSync > SQLite 直读 History 全量：" + out.size() + " 条");
             return out;
         } catch (Throwable t) {
-            Logger.log("WatchSync > SQLite 直读失败，退化 get() 兜底: " + t);
+            Logger.log("WatchSync > SQLite 直读失败，退化 get() 兑底: " + t);
             return localHistoryFallback();
         } finally {
             if (cur != null) try { cur.close(); } catch (Throwable ignored) {}

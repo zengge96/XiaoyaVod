@@ -94,11 +94,9 @@ public class AListSh extends Spider {
     @Override
     public String homeContent(boolean filter) throws Exception {
         fetchRule();
-        // 观看记录多端同步（单例 + cid 感知）：切源必进 homeContent，在此传入当前 cid。
-        // cid 不变→复用现有实例；cid 变→终止旧同步、用新 cid 重建；0.5s 探针兜底处理切离 AListSh。
+        // 观看记录多端同步（单例 + url.user 防护）：切源必进 homeContent，在此重建/复用（cid 已弃用）。
         try {
-            int cid = WatchSync.resolveHostCid(mContext);
-            watchSync = WatchSync.start(mContext, defaultDrive, cid);
+            watchSync = WatchSync.start(mContext, defaultDrive);
         } catch (Throwable t) {
             Logger.log("AListSh > WatchSync.start err: " + t);
         }

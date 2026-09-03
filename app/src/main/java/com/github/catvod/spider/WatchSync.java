@@ -61,6 +61,8 @@ public class WatchSync {
     private static final long PULL_PERIOD_SEC = 30;
     /** 墓碑有效期（毫秒）：超过该时长不再写回远端，避免墓碑无限累积。 */
     private static final long TOMBSTONE_TTL_MS = 60L * 24 * 60 * 60 * 1000; // 60 天
+    /** 延迟删除确认期（毫秒）：疑似删除先记录不落墓碑，满该时长后再次确认仍缺失才生成墓碑。 */
+    private static final long DELETE_CONFIRM_MS = 10 * 1000L;
     /** cid 探针周期（毫秒）：纯兜底，检测已离开 AListSh / 切到别的 cid 时立即停机（不自愈）。 */
     private static final long CID_PROBE_MS = 500;
 
@@ -79,6 +81,8 @@ public class WatchSync {
     private List<String> lastSnapshot = Collections.emptyList();
     /** 本机上次同步后的历史片名集合（仅内存、不持久化），用于与当前本地对比生成删除墓碑。 */
     private final Set<String> localSnap = new HashSet<>();
+    /** 延迟删除确认集：片名 -> 首次疑似删除时刻（未满 {@link #DELETE_CONFIRM_MS} 时先记着，不立即生成墓碑）。 */
+    private final Map<String, Long> pendingDelete = new HashMap<>();
 
     /** 用于记录AList配置的真实cid（本实例锁定的 cid，同步只认这个 cid）。 */
     private final int alistCid;
@@ -525,7 +529,7 @@ public class WatchSync {
             if (stopped) return;
             // 读前 cid 守卫：cid 一翻转（切走）立即停机放弃，防跨用户误删
             if (cidGuard("同步")) return;
-            // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑 =====
+            // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑（延迟确认）=====
             List<?> local = localHistoryFull();                    // 本机全量
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名
             for (Object o : local) {
@@ -534,10 +538,28 @@ public class WatchSync {
             }
             long now = System.currentTimeMillis();
             Map<String, Long> myTombs = new HashMap<>();
-            for (String n : localSnap) {                            // 上次同步时本机有、现在没了 → 本机删除
-                if (!currentLocal.contains(n)) {
+
+            // 1a. 处理既有 pendingDelete：记录回归则撤销；满 DELETE_CONFIRM_MS 仍缺失才确认生成墓碑
+            Iterator<Map.Entry<String, Long>> pendIt = pendingDelete.entrySet().iterator();
+            while (pendIt.hasNext()) {
+                Map.Entry<String, Long> pe = pendIt.next();
+                String n = pe.getKey();
+                if (currentLocal.contains(n)) {
+                    pendIt.remove();
+                    Logger.log("WatchSync > 延迟删除已撤销（记录回归）: " + n);
+                } else if (now - pe.getValue() >= DELETE_CONFIRM_MS) {
+                    pendIt.remove();
                     myTombs.put(n, now);
-                    Logger.log("WatchSync > 检测到本机删除，生成墓碑: " + n);
+                    Logger.log("WatchSync > 确认删除（延迟" + DELETE_CONFIRM_MS + "ms 后仍缺失）生成墓碑: " + n);
+                } else {
+                    Logger.log("WatchSync > 延迟删除观察中（" + (now - pe.getValue()) + "ms < " + DELETE_CONFIRM_MS + "ms）: " + n);
+                }
+            }
+            // 1b. 新增疑似删除：localSnap 有而当前没有 → 先记 pending，不立即生成墓碑（防切换瞬间误读空集）
+            for (String n : localSnap) {
+                if (!currentLocal.contains(n) && !pendingDelete.containsKey(n)) {
+                    pendingDelete.put(n, now);
+                    Logger.log("WatchSync > 疑似删除（先记录，延迟确认）: " + n);
                 }
             }
 

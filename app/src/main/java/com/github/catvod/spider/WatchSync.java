@@ -514,27 +514,57 @@ public class WatchSync {
             try (Cursor c = db.rawQuery("SELECT createTime FROM History WHERE \"key\" = ?", new String[]{key})) {
                 if (c.moveToFirst() && c.getLong(0) >= ctime) return;
             }
-            ContentValues cv = new ContentValues();
+            ContentValues cv = buildHistoryValues(db, rec);          // 动态按真实表结构填列，兼容各 fork 的 schema 差异
             cv.put("key", key);
             cv.put("cid", anchorCid);                                // 强制锚定 cid
-            cv.put("vodPic", rec.optString("vodPic"));
-            cv.put("vodName", rec.optString("vodName"));
-            cv.put("vodFlag", rec.optString("vodFlag"));
-            cv.put("vodRemarks", rec.optString("vodRemarks"));
-            cv.put("episodeUrl", rec.optString("episodeUrl"));
-            cv.put("revSort", rec.optBoolean("revSort", false) ? 1 : 0);   // Room: boolean 存 INTEGER(0/1)
-            cv.put("revPlay", rec.optBoolean("revPlay", false) ? 1 : 0);
-            cv.put("createTime", ctime);
-            cv.put("opening", rec.optLong("opening", 0L));
-            cv.put("ending", rec.optLong("ending", 0L));
-            cv.put("position", rec.optLong("position", 0L));
-            cv.put("duration", rec.optLong("duration", 0L));
-            cv.put("speed", (float) rec.optDouble("speed", 1.0));     // Room: float 存 REAL
-            cv.put("scale", rec.optInt("scale", -1));
             db.insertWithOnConflict("History", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
         } catch (Throwable t) {
             Logger.log("WatchSync > upsertHistory err: " + t);
         }
+    }
+
+    /**
+     * 按 History 表<b>真实结构</b>（PRAGMA table_info）动态构造插入值，兼容不同 fork：
+     * 主线 FongMi 无 player 列、OK影视 fork 有 player 且 NOT NULL。有值的列用记录值，
+     * 缺值且 NOT NULL 的列按列类型填默认（TEXT→""、INTEGER/FLOAT→0、boolean→0、float→0.0），
+     * 缺值且可空的列跳过交给 DB 默认。key/cid 由调用方单独强制。
+     */
+    private ContentValues buildHistoryValues(SQLiteDatabase db, JSONObject rec) {
+        ContentValues cv = new ContentValues();
+        try (Cursor c = db.rawQuery("PRAGMA table_info(History)", null)) {
+            int iName = c.getColumnIndex("name");
+            int iType = c.getColumnIndex("type");
+            int iNotNull = c.getColumnIndex("notnull");
+            while (c.moveToNext()) {
+                String col = c.getString(iName);
+                if (col == null || col.equals("key") || col.equals("cid")) continue;
+                String typ = c.getString(iType);
+                boolean notNull = c.getInt(iNotNull) != 0;
+                boolean has = !rec.isNull(col) && rec.has(col);
+                try {
+                    String t = typ == null ? "" : typ.toUpperCase();
+                    boolean isText = t.contains("TEXT") || t.contains("CHAR") || t.contains("CLOB");
+                    boolean isReal = t.contains("REAL") || t.contains("FLO") || t.contains("DOUB");
+                    if (col.equals("revSort") || col.equals("revPlay")) {
+                        cv.put(col, has ? (rec.optBoolean(col, false) ? 1 : 0) : 0);   // Room: boolean 存 INTEGER(0/1)
+                    } else if (isText) {
+                        if (has) cv.put(col, rec.optString(col, ""));
+                        else if (notNull) cv.put(col, "");
+                    } else if (isReal) {
+                        if (has) cv.put(col, rec.optDouble(col, 0.0));
+                        else if (notNull) cv.put(col, 0.0);
+                    } else {
+                        if (has) cv.put(col, rec.optLong(col, 0L));
+                        else if (notNull) cv.put(col, 0L);
+                    }
+                } catch (Throwable t) {
+                    Logger.log("WatchSync > buildHistoryValues col=" + col + " err: " + t);
+                }
+            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > buildHistoryValues err: " + t);
+        }
+        return cv;
     }
 
     /**

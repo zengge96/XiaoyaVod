@@ -446,8 +446,8 @@ public class WatchSync {
     private void pollLocal() {
         try {
             if (stopped) return;
-            // 读前 cid 守卫：cid 一翻转（切走）立即停机放弃，防跨用户误删
-            if (cidGuard("轮询")) return;
+            // 读写前 user 守卫：url.user 与 username 不一致 → 停机并放弃本轮
+            if (userMismatch("轮询")) return;
             List<?> local = localHistoryFull();
             List<String> sig = snapshotOf(local);
             if (!sig.equals(lastSnapshot)) {
@@ -554,6 +554,53 @@ public class WatchSync {
      *
      * @return true 表示应放弃本轮
      */
+    /**
+     * 同步守卫：本地/远端读写前，用当前源 url 的 user 参数与实例 username 对比。
+     * 不一致（切到了别的用户/源）→ 停机并重置，防止跨用户读写/串台/误删。
+     *
+     * @param who 调用方标识（用于日志）
+     * @return true 表示应放弃本轮
+     */
+    private boolean userMismatch(String who) {
+        if (stopped) return true;
+        String cur = currentConfigUser();
+        if (cur == null || cur.isEmpty()) {
+            Logger.log("WatchSync > [user守卫/" + who + "] 无法从 url 取到 user（cur=" + cur + "）→ 停机并放弃本轮");
+            stop();
+            return true;
+        }
+        if (!cur.equals(this.username)) {
+            Logger.log("WatchSync > [user守卫/" + who + "] url.user=[" + cur + "] 与 username=[" + this.username + "] 不一致 → 停机并放弃本轮（防跨用户读写）");
+            stop();
+            return true;
+        }
+        return false;
+    }
+
+    /** 从当前源配置 url 解析 user 参数（如 t.json?user=zengge99 → "zengge99"）；取不到返回 null。 */
+    private String currentConfigUser() {
+        if (configGetUrl == null || vodConfigVod == null) {
+            Logger.log("WatchSync > [user] vod/configGetUrl 反射不可用");
+            return null;
+        }
+        try {
+            Object cfg = vodConfigVod.invoke(null);
+            if (cfg == null) return null;
+            Object urlObj = configGetUrl.invoke(cfg);
+            if (urlObj == null) return null;
+            String url = urlObj.toString();
+            int i = url.indexOf("user=");
+            if (i < 0) return null;
+            String rest = url.substring(i + 5);
+            int amp = rest.indexOf('&');
+            String user = amp < 0 ? rest : rest.substring(0, amp);
+            return user.isEmpty() ? null : user;
+        } catch (Throwable t) {
+            Logger.log("WatchSync > [user] 解析 url 异常: " + t);
+            return null;
+        }
+    }
+
     private boolean cidGuard(String who) {
         if (stopped) return true;
         int cur = currentCid();
@@ -580,8 +627,8 @@ public class WatchSync {
     private void pullAndPush() {
         try {
             if (stopped) return;
-            // 读前 cid 守卫：cid 一翻转（切走）立即停机放弃，防跨用户误删
-            if (cidGuard("同步")) return;
+            // 读写前 user 守卫：url.user 与 username 不一致 → 停机并放弃本轮
+            if (userMismatch("同步")) return;
             // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑（延迟确认）=====
             List<?> local = localHistoryFull();                    // 本机全量
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名
@@ -1033,6 +1080,8 @@ public class WatchSync {
     /** 读取远端同步文件全文；读取失败返回 null（调用方自行区分空文件与失败）。 */
     private String readRemote() {
         try {
+            // 远端读前 user 守卫：url.user 与 username 不一致 → 停机并放弃
+            if (userMismatch("远端读")) return null;
             String out = drive.exec("cat \"" + syncPath + "\"");
             if (out == null) {
                 Logger.log("WatchSync > readRemote: 远端返回 null");
@@ -1051,6 +1100,8 @@ public class WatchSync {
      */
     private void writeRemote(String json) {
         try {
+            // 远端写前 user 守卫：url.user 与 username 不一致 → 停机并放弃（绝不写错用户文件）
+            if (userMismatch("远端写")) return;
             String b64 = android.util.Base64.encodeToString(json.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
             String cmd = "printf '%s' '" + b64 + "' | base64 -d > \"" + syncPath + ".tmp\" && mv \"" + syncPath + ".tmp\" \"" + syncPath + "\"";
             String res = drive.exec(cmd);

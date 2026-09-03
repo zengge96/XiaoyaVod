@@ -104,7 +104,9 @@ public class WatchSync {
     private Object appDb;                   // AppDatabase（或 _Impl）单例实例
     private Method daoGetter;               // AppDatabase 上取 HistoryDao 的方法
     private Method daoFindAll;              // HistoryDao 上取全量的方法（findAll/getAll/loadAll）
-    private Method vodGetCid;               // VodConfig.getCid() -> 当前播放源 id（可为 null）
+    private Method vodGetCid;               // 候选1: VodConfig.getCid() -> 当前播放源 id
+    private Method vodConfigVod;            // 候选2: Config.vod() -> 当前 vod 配置实例（OK影视等魔改壳）
+    private Method configGetId;             // 候选2: Config.getId() -> 配置实例的 id
 
     /** 远端解析结果。 */
     private static class RemoteData {
@@ -288,14 +290,26 @@ public class WatchSync {
         try {
             Class<?> vod = Class.forName(appPkg + ".api.config.VodConfig");
             vodGetCid = vod.getMethod("getCid");
-            Logger.log("WatchSync > VodConfig.getCid() 反射成功: className=" + vod.getName() + " method=" + vodGetCid
+            Logger.log("WatchSync > 候选1 VodConfig.getCid() 反射成功: className=" + vod.getName() + " method=" + vodGetCid
                     + " 宿主App包=" + appPkg);
         } catch (Throwable t) {
             vodGetCid = null;
-            Logger.log("WatchSync > VodConfig.getCid() 反射失败，vodGetCid=null: " + t);
+            Logger.log("WatchSync > 候选1 VodConfig.getCid() 反射失败，vodGetCid=null: " + t);
         }
-        // 锁定本机播放源 cid：必须放在 initReflection 最末尾、vodGetCid 就绪之后取，
-        // 否则 currentCid() 因 vodGetCid 为 null 返回 -1，导致下面的 guard 永远拦截、同步被关死。
+        // 候选2（OK影视等魔改壳，无 api.config.VodConfig）：com.fongmi.android.tv.bean.Config.vod().getId()
+        try {
+            Class<?> cfg = Class.forName(appPkg + ".bean.Config");
+            vodConfigVod = cfg.getMethod("vod");
+            configGetId = cfg.getMethod("getId");
+            Logger.log("WatchSync > 候选2 Config.vod().getId() 反射成功: className=" + cfg.getName() + " vod=" + vodConfigVod
+                    + " getId=" + configGetId);
+        } catch (Throwable t) {
+            vodConfigVod = null;
+            configGetId = null;
+            Logger.log("WatchSync > 候选2 Config.vod().getId() 反射失败: " + t);
+        }
+        // 锁定本机播放源 cid：必须放在 initReflection 最末尾、cid 反射就绪之后取，
+        // 否则 currentCid() 拿不到返回 -1，导致下面的 guard 永远拦截、同步被关死。
         this.alistCid = currentCid();
         Logger.log("WatchSync > initReflection 末尾锁定 alistCid(initCid)=" + this.alistCid);
     }
@@ -779,26 +793,38 @@ public class WatchSync {
 
     /** 当前播放源 id；反射不可用返回 -1（表示不过滤）。 */
     private int currentCid() {
-        if (vodGetCid == null) {
-            // 情况1：getCid 反射压根没找到（类或方法缺失）
-            Logger.log("WatchSync > [cid] currentCid: vodGetCid==null（反射未就绪），返回 -1");
-            return -1;
-        }
-        try {
-            Object v = vodGetCid.invoke(null);
-            if (v instanceof Number) {
-                int cid = ((Number) v).intValue();
-                // 情况4正常：返回具体数字，可能为 0 或正数
-                return cid;
+        // 候选1：标准 fongmi VodConfig.getCid()（静态、返回 int）
+        if (vodGetCid != null) {
+            try {
+                Object v = vodGetCid.invoke(null);
+                if (v instanceof Number) {
+                    return ((Number) v).intValue();
+                }
+                Logger.log("WatchSync > [cid] 候选1 getCid() 返回非数字: " + (v == null ? "null" : v.getClass().getName()) + "，尝试候选2");
+            } catch (Throwable t) {
+                Logger.log("WatchSync > [cid] 候选1 getCid() 调用异常: " + t.getClass().getSimpleName() + ": " + t.getMessage() + "，尝试候选2");
             }
-            // 情况3：返回了非数字类型
-            Logger.log("WatchSync > [cid] currentCid: getCid() 返回非数字类型: " + (v == null ? "null" : v.getClass().getName()) + " -> -1");
-            return -1;
-        } catch (Throwable t) {
-            // 情况2：getCid() 内部抛异常（最可能是 VodConfig.getConfig() 为 null -> NPE，即播放器配置未加载）
-            Logger.log("WatchSync > [cid] currentCid: 调用 getCid() 抛异常 -> -1: " + t.getClass().getSimpleName() + ": " + t.getMessage());
-            return -1;
         }
+        // 候选2：OK影视壳 Com.fongmi.android.tv.bean.Config.vod().getId()
+        if (vodConfigVod != null && configGetId != null) {
+            try {
+                Object cfg = vodConfigVod.invoke(null);
+                if (cfg != null) {
+                    Object v = configGetId.invoke(cfg);
+                    if (v instanceof Number) {
+                        return ((Number) v).intValue();
+                    }
+                    Logger.log("WatchSync > [cid] 候选2 getId() 返回非数字: " + (v == null ? "null" : v.getClass().getName()));
+                } else {
+                    Logger.log("WatchSync > [cid] 候选2 Config.vod() 返回 null");
+                }
+            } catch (Throwable t) {
+                Logger.log("WatchSync > [cid] 候选2 getId() 调用异常: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        }
+        // 都没有可用反射
+        Logger.log("WatchSync > [cid] currentCid: 无可用 cid 反射，返回 -1");
+        return -1;
     }
 
     /** 读取 History 对象的片名，失败返回空串。 */

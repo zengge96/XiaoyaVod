@@ -1,6 +1,8 @@
 package com.github.catvod.spider;
 
 import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 
 import com.github.catvod.bean.alist.Drive;
 
@@ -9,6 +11,7 @@ import org.json.JSONObject;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -105,9 +108,6 @@ public class WatchSync {
     private Method histGetPosition;         // History.getPosition()（可为 null）
     private Method histGetDuration;         // History.getDuration()（可为 null）
 
-    private Object appDb;                   // AppDatabase（或 _Impl）单例实例
-    private Method daoGetter;               // AppDatabase 上取 HistoryDao 的方法
-    private Method daoFindAll;              // HistoryDao 上取全量的方法（findAll/getAll/loadAll）
     private Method vodConfigVod;            // 候选2: Config.vod() -> 当前 vod 配置实例（OK影视等魔改壳）
     private Method configGetUrl;            // 候选2: Config.getUrl() -> 源配置 url（跨设备稳定，用于解析 user=）
 
@@ -244,74 +244,10 @@ public class WatchSync {
             Logger.log("WatchSync > History.delete() 反射失败，将无法在本地执行墓碑删除: " + t);
         }
 
-        // AppDatabase.get().getHistoryDao().findAll()：取本机全量历史（避开 get() 的 LIMIT 60 截断）。
-        // 真机 AppDatabase 可能因混淆/改签名找不到 get()，故做多候选兼容：
-        //   优先试 AppDatabase，再试 Room 生成的 AppDatabase_Impl；
-        //   单例方法先 getMethod 再回退 getDeclaredMethod（连私有/包级也能拿）；
-        //   DAO 方法在实例上按返回类型扫；findAll 在 DAO 实现上找“无参返回 List”的方法。
-        // 任何一步失败都整体降级为 get() 兜底，不影响主流程。
-        appDb = null;
-        daoGetter = null;
-        daoFindAll = null;
-        try {
-            Class<?> dbCls = null;
-            for (String c : new String[]{appPkg + ".db.AppDatabase", appPkg + ".db.AppDatabase_Impl"}) {
-                try {
-                    dbCls = Class.forName(c);
-                    if (dbCls != null) break;
-                } catch (Throwable ignored) {
-                }
-            }
-            if (dbCls != null) {
-                for (String m : new String[]{"get", "getInstance", "getDatabase", "getDb"}) {
-                    Method mm = null;
-                    try {
-                        mm = dbCls.getMethod(m);
-                    } catch (Throwable ignored) {
-                    }
-                    if (mm == null) {
-                        try {
-                            mm = dbCls.getDeclaredMethod(m);
-                            if (mm != null) mm.setAccessible(true);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    if (mm != null) {
-                        try {
-                            appDb = mm.invoke(null);
-                            if (appDb != null) break;
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-                if (appDb != null) {
-                    for (Method me : appDb.getClass().getMethods()) {
-                        if (me.getParameterCount() != 0) continue;
-                        if (me.getName().toLowerCase().contains("historydao")) {
-                            daoGetter = me;
-                            break;
-                        }
-                    }
-                    if (daoGetter != null) {
-                        Object dao = daoGetter.invoke(appDb);
-                        if (dao != null) {
-                            for (Method me : dao.getClass().getMethods()) {
-                                if (me.getParameterCount() != 0) continue;
-                                if (!List.class.isAssignableFrom(me.getReturnType())) continue;
-                                String n = me.getName().toLowerCase();
-                                if (n.equals("findall") || n.equals("getall") || n.equals("loadall")) {
-                                    daoFindAll = me;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Logger.log("WatchSync > AppDatabase.findAll 反射就绪: " + (daoFindAll != null));
-        } catch (Throwable t) {
-            Logger.log("WatchSync > AppDatabase 反射失败，将退化为 get() 兜底: " + t);
-        }
+        // 本机全量历史改为 SQLite 直读（见 localHistoryFull()），不再走 AppDatabase/DAO 反射：
+        // 反编译确认宿主 AppDatabase/DAO 被 R8 彻底混淆（get()→n()、findAll 改名、DAO→q3/*），
+        // 按名反射拿不到 findAll；而 SQLiteDatabase 是系统组件不混淆，直接 SELECT * FROM History 即可，
+        // 不再初始化 appDb/daoGetter/daoFindAll。History bean 的反射仍保留（objectFrom/sync 等沿用）。
 
         // 候选2（OK影视等魔改壳）：com.fongmi.android.tv.bean.Config.vod() + getUrl()
         // url 是该源配置的稳定标识，用于解析 user= 参数做跨用户防护。
@@ -788,20 +724,54 @@ public class WatchSync {
      * cid 在跨设备/跨源下不可靠，已弃用，不再按源过滤。
      */
     private List<Object> localHistoryFull() {
-        if (appDb != null && daoGetter != null && daoFindAll != null) {
-            try {
-                Object dao = daoGetter.invoke(appDb);
-                if (dao != null) {
-                    Object all = daoFindAll.invoke(dao);
-                    if (all instanceof List) {
-                        return (List<Object>) all;
+        List<Object> out = new ArrayList<>();
+        SQLiteDatabase db = null;
+        Cursor cur = null;
+        try {
+            File dbf = context.getDatabasePath("tv");
+            if (dbf == null || !dbf.exists()) {
+                Logger.log("WatchSync > SQLite 直读失败：库文件不存在 " + (dbf == null ? "null" : dbf.getPath()));
+                return localHistoryFallback();
+            }
+            db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+            cur = db.rawQuery("SELECT * FROM History", null);
+            String[] cols = cur.getColumnNames();
+            while (cur.moveToNext()) {
+                JSONObject j = new JSONObject();
+                for (String col : cols) {
+                    int idx = cur.getColumnIndex(col);
+                    if (idx < 0) continue;
+                    if (cur.isNull(idx)) continue;
+                    try {
+                        int t = cur.getType(idx);
+                        if (t == Cursor.FIELD_TYPE_STRING) {
+                            j.put(col, cur.getString(idx));
+                        } else if (t == Cursor.FIELD_TYPE_INTEGER) {
+                            j.put(col, cur.getLong(idx));
+                        } else if (t == Cursor.FIELD_TYPE_FLOAT) {
+                            j.put(col, cur.getDouble(idx));
+                        } else if (t == Cursor.FIELD_TYPE_BLOB) {
+                            j.put(col, android.util.Base64.encodeToString(cur.getBlob(idx), android.util.Base64.NO_WRAP));
+                        }
+                    } catch (Throwable ignored) {
                     }
                 }
-            } catch (Throwable t) {
-                Logger.log("WatchSync > findAll 失败，退化 get() 兜底: " + t);
+                try {
+                    Object obj = historyObjectFrom.invoke(null, j.toString());
+                    if (obj != null) out.add(obj);
+                } catch (Throwable t) {
+                    Logger.log("WatchSync > SQLite 直读 objectFrom 失败，跳过一行: " + t);
+                }
             }
+            Logger.log("WatchSync > SQLite 直读 History 全量：" + out.size() + " 条");
+            return out;
+        } catch (Throwable t) {
+            Logger.log("WatchSync > SQLite 直读失败，退化 get() 兜底: " + t);
+            return localHistoryFallback();
+        } finally {
+            if (cur != null) try { cur.close(); } catch (Throwable ignored) {}
+            if (db != null && db.isOpen()) try { db.close(); } catch (Throwable ignored) {}
         }
-        return localHistoryFallback();
     }
 
     /** 读取 History 对象的片名，失败返回空串。 */

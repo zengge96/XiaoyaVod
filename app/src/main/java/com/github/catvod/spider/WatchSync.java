@@ -61,10 +61,11 @@ public class WatchSync {
     private static final long PULL_PERIOD_SEC = 30;
     /** 墓碑有效期（毫秒）：超过该时长不再写回远端，避免墓碑无限累积。 */
     private static final long TOMBSTONE_TTL_MS = 60L * 24 * 60 * 60 * 1000; // 60 天
-    /** cid 探针周期（毫秒）：高频监控当前播放源 cid 是否变化。 */
+    /** cid 探针周期（毫秒）：纯兜底，检测已离开 AListSh / 切到别的 cid 时立即停机（不自愈）。 */
     private static final long CID_PROBE_MS = 500;
-    /** cid 变化后的抑制期（毫秒）：必须满 15s 且 cid 回到 initCid 才恢复同步。 */
-    private static final long CID_SUPPRESS_MS = 15 * 1000;
+
+    /** 进程内单例：反复 start() 只维护一个实例（cid 变时停机重建、cid 不变时复用）。 */
+    private static volatile WatchSync instance;
 
     private final Context context;
     private final Drive drive;
@@ -79,13 +80,10 @@ public class WatchSync {
     /** 本机上次同步后的历史片名集合（仅内存、不持久化），用于与当前本地对比生成删除墓碑。 */
     private final Set<String> localSnap = new HashSet<>();
 
-    /** 用于记录AList配置的真实cid（初始化时锁定，同步只认这个 cid）。 */
-    private int alistCid;
-    /** 是否处于 cid 抑制态：抑制期内不读取/不写入远端、不拍快照、不生成墓碑。
-     *  只在 cid 回到 initCid 且距最近一次变化满 15s 后恢复。 */
-    private volatile boolean cidSuppressed;
-    /** 最近一次检测到 cid 变化的时刻（毫秒）。 */
-    private volatile long lastCidChangeTime;
+    /** 用于记录AList配置的真实cid（本实例锁定的 cid，同步只认这个 cid）。 */
+    private final int alistCid;
+    /** 是否已停止（停机后不再读/写/拍快照/打墓碑，等下次 homeContent 用新 cid 重建）。 */
+    private volatile boolean stopped;
 
     // ---------------- 反射缓存 ----------------
     // 由于 WatchSync 是 spider 插件，运行在宿主播放器内，History 等类是宿主应用的，
@@ -114,10 +112,11 @@ public class WatchSync {
         Map<String, Long> tombstones = new LinkedHashMap<>();
     }
 
-    private WatchSync(Context context, Drive drive, String username, String syncPath) {
+    private WatchSync(Context context, Drive drive, String username, String syncPath, int cid) {
         this.context = context;
         this.drive = drive;
         this.username = username == null ? "" : username;
+        this.alistCid = cid;
         // 每用户一个远端文件：避免多用户共享单文件互相干扰（如 watch.txt -> watch.<username>.txt）
         this.syncPath = isolatedPath(syncPath, this.username);
         ensureRemoteDir();
@@ -150,38 +149,111 @@ public class WatchSync {
      *
      * @return 启动成功的实例；条件不满足或初始化失败返回 null（静默降级，不影响播放器）。
      */
-    public static WatchSync start(Context context, Drive drive) {
+    /**
+     * 启动同步（进程内单例）。由 AListSh.homeContent 每次切入时调用，并传入当前 cid。
+     * <ul>
+     *   <li><b>cid 不变</b>（= 现有单例锁定的 cid，且未停机）→ 直接复用，不重建；</li>
+     *   <li><b>cid 变了</b>（= 切到另一个 AListSh 用户 / 从别处切回 AList）→ 立即停止旧实例并全新重建；</li>
+     *   <li><b>兜底 0.5s 探针</b>检测到已离开 AListSh（cid 变化、找不到 homeContent 场景）→ 直接停机不自愈。</li>
+     * </ul>
+     *
+     * @return 启动成功的单例；条件不满足返回 null（静默降级，不影响播放器）。
+     */
+    public static WatchSync start(Context context, Drive drive, int cid) {
         try {
             if (drive == null) {
                 Logger.log("WatchSync > 未启用：defaultDrive 为空");
                 return null;
             }
             Logger.log("WatchSync > defaultDrive=" + drive.getName() + " syncWatch=" + drive.syncWatch()
-                    + " username=[" + drive.getUsername() + "] syncPath=[" + drive.getSyncPath() + "]");
+                    + " username=[" + drive.getUsername() + "] syncPath=[" + drive.getSyncPath() + "] 传入cid=" + cid);
             if (!drive.syncWatch() || drive.getSyncPath().isEmpty()) {
                 Logger.log("WatchSync > 未启用：syncWatch=false 或 syncPath 为空");
                 return null;
             }
-            WatchSync ws = new WatchSync(context, drive, drive.getUsername(), drive.getSyncPath());
-            ws.initReflection();
-            if (ws.alistCid <= 0) {
-                // 机制2：初始化时 cid 未知/取不到（含反射失败返回 -1）→ 整个同步停，避免在错误 cid 下误删
-                Logger.log("WatchSync > 停止同步：initCid 未知/取不到（initCid=" + ws.alistCid + "），不同步");
-                return null;
+            synchronized (WatchSync.class) {
+                WatchSync cur = instance;
+                // cid 不变且仍在运行 → 复用，不重建
+                if (cur != null && !cur.stopped && cur.alistCid == cid) {
+                    Logger.log("WatchSync > cid 不变(" + cid + ")，复用现有实例，不重建");
+                    return cur;
+                }
+                // 需要停机重建：cid 变了 或 旧实例已停机
+                if (cur != null) {
+                    Logger.log("WatchSync > cid 变化/需重建：旧cid=" + cur.alistCid + " -> 新cid=" + cid + ", 停止旧实例");
+                    cur.stop();
+                }
+                // 全新创建
+                WatchSync ws = new WatchSync(context, drive, drive.getUsername(), drive.getSyncPath(), cid);
+                ws.initReflection();
+                ws.schedule();
+                ws.scheduler.execute(ws::pullAndPush);
+                ws.scheduler.execute(ws::refreshLocalSnap);
+                instance = ws;
+                Logger.log("WatchSync > 启动完成：全新实例 cid=" + cid);
+                return ws;
             }
-            Logger.log("WatchSync > 锁定 initCid=" + ws.alistCid + "，本任务只同步这个 cid 的本地记录");
-            ws.schedule();
-            // 启动先同步一次，让远端已有记录尽快并入本机（首轮与当前逻辑等价，不抑制）
-            ws.scheduler.execute(ws::pullAndPush);
-            // 首次同步后初始化 localSnap 基线（记录后续用于生成删除墓碑的本地历史）
-            // 用与“每次同步后更新”同一个函数 refreshLocalSnap()，保证初始与更新一致
-            ws.scheduler.execute(ws::refreshLocalSnap);
-            Logger.log("WatchSync > 启动完成");
-            return ws;
         } catch (Throwable t) {
             Logger.log("WatchSync > start failed: " + t);
             return null;
         }
+    }
+
+    /** 停机：停止调度、清空内部状态，等待下次 homeContent 用新 cid 重建。停机后不再读/写远端、不拍快照、不打墓碑。 */
+    private void stop() {
+        if (stopped) return;
+        stopped = true;
+        try {
+            scheduler.shutdownNow();
+        } catch (Throwable t) {
+            Logger.log("WatchSync > stop: 关闭 scheduler 异常: " + t);
+        }
+        localSnap.clear();
+        lastSnapshot = Collections.emptyList();
+        Logger.log("WatchSync > 已停机（cid=" + alistCid + "），清空快照，等待 homeContent 重建");
+    }
+
+    /**
+     * 解析宿主当前 cid（多候选反射），供 AListSh.homeContent 取当前 cid 后传入 {@link #start}。
+     * 候选1：api.config.VodConfig.getCid()（标准 fongmi）；候选2：bean.Config.vod().getId()（OK影视等）。
+     */
+    public static int resolveHostCid(Context context) {
+        String appPkg = context == null ? "" : context.getPackageName();
+        if (appPkg.isEmpty() && context != null) {
+            try {
+                appPkg = context.getPackageName();
+            } catch (Throwable ignored) {
+            }
+        }
+        // 候选2（优先，覆盖魔改壳）：bean.Config.vod().getId()
+        try {
+            Class<?> cfg = Class.forName(appPkg + ".bean.Config");
+            Method vod = cfg.getMethod("vod");
+            Method getId = cfg.getMethod("getId");
+            Object cur = vod.invoke(null);
+            if (cur != null) {
+                Object v = getId.invoke(cur);
+                if (v instanceof Number) {
+                    Logger.log("WatchSync > resolveHostCid: 候选2 Config.vod().getId()=" + v);
+                    return ((Number) v).intValue();
+                }
+            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > resolveHostCid: 候选2 失败: " + t);
+        }
+        // 候选1（标准 fongmi）：api.config.VodConfig.getCid()
+        try {
+            Class<?> vod = Class.forName(appPkg + ".api.config.VodConfig");
+            Object v = vod.getMethod("getCid").invoke(null);
+            if (v instanceof Number) {
+                Logger.log("WatchSync > resolveHostCid: 候选1 VodConfig.getCid()=" + v);
+                return ((Number) v).intValue();
+            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > resolveHostCid: 候选1 失败: " + t);
+        }
+        Logger.log("WatchSync > resolveHostCid: 无可用 cid 反射，返回 -1");
+        return -1;
     }
 
     /** 初始化全部反射缓存。失败的方法置空或抛出，由上层兜底。 */
@@ -308,10 +380,8 @@ public class WatchSync {
             configGetId = null;
             Logger.log("WatchSync > 候选2 Config.vod().getId() 反射失败: " + t);
         }
-        // 锁定本机播放源 cid：必须放在 initReflection 最末尾、cid 反射就绪之后取，
-        // 否则 currentCid() 拿不到返回 -1，导致下面的 guard 永远拦截、同步被关死。
-        this.alistCid = currentCid();
-        Logger.log("WatchSync > initReflection 末尾锁定 alistCid(initCid)=" + this.alistCid);
+        // 本实例锁定 cid 已由 start(cid) 传入（构造函数中 alistCid=cid），此处不再读取 currentCid() 覆盖
+        Logger.log("WatchSync > initReflection 完成：本实例 cid(initCid)=" + this.alistCid);
     }
 
     /** 由已解析 History 类反推宿主应用包名（截掉 ".bean.History" 后缀）。 */
@@ -357,11 +427,7 @@ public class WatchSync {
      */
     private void pollLocal() {
         try {
-            // 守卫：cid 未知 / 抑制中 / 已切走 → 本轮跳过
-            if (shouldSkipSync("轮询")) {
-                return;
-            }
-
+            if (stopped) return;
             List<?> local = localHistoryFull();
             List<String> sig = snapshotOf(local);
             if (!sig.equals(lastSnapshot)) {
@@ -400,65 +466,25 @@ public class WatchSync {
     }
 
     /**
-     * 0.5s cid 探针：监控当前播放源 cid 是否变化或未知。
-     * 一旦发现变化（或 cid 取不到 <=0），清空本机快照并进入抑制态；
-     * 只有「cid 回到 initCid 且距最近一次变化已满 {@link #CID_SUPPRESS_MS}」才恢复并重建基线。
+     * 0.5s cid 探针（纯兜底）：覆盖「先进 AListSh 再切到非 AListSh」场景。
+     * 此时不走 AListSh 的 homeContent，只能靠探针检测 cid 变化。
+     * 一旦 currentCid() 与实例锁定的 cid 不一致（或取不到 <=0）→ 立即停机（不自愈），
+     * 等下次切回 AListSh 由 homeContent 调 start(cid) 重新初始化。
      */
     private void monitorCid() {
         try {
-            long now = System.currentTimeMillis();
+            if (stopped) return;
             int cur = currentCid();
-            boolean changed = false;
             if (cur <= 0) {
-                Logger.log("WatchSync > [cid探针] cid 未知/取不到 cur=" + cur + " initCid=" + alistCid + " → 视为变化，进入抑制");
-                changed = true;
+                Logger.log("WatchSync > [探针兜底] cid 未知/取不到 cur=" + cur + " 实例cid=" + alistCid + " → 停机（不自愈）");
+                stop();
             } else if (cur != alistCid) {
-                Logger.log("WatchSync > [cid探针] cid 变化 cur=" + cur + " != initCid=" + alistCid + " → 进入抑制");
-                changed = true;
-            }
-            if (changed) {
-                lastCidChangeTime = now;
-                cidSuppressed = true;
-                localSnap.clear();
-                Logger.log("WatchSync > [cid探针] 已进入抑制：清空本机快照(localSnap=" + localSnap.size() + ")，" + CID_SUPPRESS_MS + "ms内不拍快照/不打墓碑(now=" + now + ")");
-                return;
-            }
-            // 到这里 cur == initCid（且 >0）
-            if (cidSuppressed) {
-                long elapsed = now - lastCidChangeTime;
-                if (elapsed >= CID_SUPPRESS_MS) {
-                    cidSuppressed = false;
-                    Logger.log("WatchSync > [cid探针] cid 回 initCid(" + cur + ") 且距变化已满 " + elapsed + "ms → 恢复同步，重建基线");
-                    refreshLocalSnap();
-                } else {
-                    Logger.log("WatchSync > [cid探针] 仍抑制：cid=" + cur + "==initCid 但距变化仅 " + elapsed + "ms(<" + CID_SUPPRESS_MS + "ms)，继续等待");
-                }
+                Logger.log("WatchSync > [探针兜底] 检测到已离开 AListSh：实例cid=" + alistCid + " 当前=" + cur + " → 建成停机（不自愈，等 homeContent 重建）");
+                stop();
             }
         } catch (Throwable t) {
-            Logger.log("WatchSync > [cid探针] err: " + t);
+            Logger.log("WatchSync > [探针兜底] err: " + t);
         }
-    }
-
-    /**
-     * 同步守卫：cid 未知 / 抑制中 / 已切走 → 返回 true（本轮 pullAndPush/pollLocal 应跳过）。
-     *
-     * @param who 调用方标识（用于日志）
-     */
-    private boolean shouldSkipSync(String who) {
-        int cur = currentCid();
-        if (cur <= 0) {
-            Logger.log("WatchSync > [" + who + "] 跳过：cid 未知 cur=" + cur + " initCid=" + alistCid);
-            return true;
-        }
-        if (cidSuppressed) {
-            Logger.log("WatchSync > [" + who + "] 跳过：抑制中（cid 变化未满" + CID_SUPPRESS_MS + "ms，lastCidChange=" + lastCidChangeTime + "）");
-            return true;
-        }
-        if (cur != alistCid) {
-            Logger.log("WatchSync > [" + who + "] 跳过：已切到其他源/配置 cur=" + cur + " != initCid=" + alistCid + "（本任务只同步 initCid）");
-            return true;
-        }
-        return false;
     }
 
     // -------------------- 统一同步流程 pullAndPush --------------------
@@ -475,10 +501,7 @@ public class WatchSync {
      */
     private void pullAndPush() {
         try {
-            // 守卫：cid 未知 / 抑制中 / 已切走 → 本轮跳过
-            if (shouldSkipSync("同步")) {
-                return;
-            }
+            if (stopped) return;
             // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑 =====
             List<?> local = localHistoryFull();                    // 本机全量
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名

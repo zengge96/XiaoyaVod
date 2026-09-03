@@ -79,6 +79,14 @@ public class WatchSync {
     private final String username;
     /** 锚定的源 cid：homeContent 初始化时取一次并锁死，本地历史只同步该 cid 分区。 */
     private int anchorCid = -1;
+    /** cid 防护探测节流（毫秒）：避免每 3 秒轮询都做一次反射。 */
+    private static final long CID_PROBE_MS = 2000L;
+    /** 上次静默探测到的当前源 cid，供防护比对（anchorCid 恒定，此值随切换源变化）。 */
+    private volatile int lastProbeCid = -1;
+    /** 上次探测时间戳，用于节流。 */
+    private volatile long lastProbeAt = 0L;
+    /** 当前是否处于"cid 偏离锚定、本轮整体跳过"状态（只在状态翻转时打日志，避免刷屏）。 */
+    private volatile boolean cidBlocked = false;
     /** 远端同步文件路径（已按用户名隔离）。 */
     private final String syncPath;
 
@@ -236,7 +244,34 @@ public class WatchSync {
         Logger.log("WatchSync > initReflection 完成：本实例 user=" + this.username);
     }
 
-    /** 解析当前源配置的 cid（多候选反射）：候选1 api.config.VodConfig.getCid()；候选2 Config.vod().getId()。取不到返回 -1。 */
+    /** 解析当前源配置的 cid（多候选反射）：候选1 Config.vod().getId()；候选2 VodConfig.getCid()。取不到返回 -1。静默版，不刷日志（供高频防护探测）。 */
+    private int probeCidQuiet() {
+        String appPkg = appPackage();
+        // 候选1（优先，因为宿主是 OK影视 等魔改壳，日志证实 Config.vod() 反射成功）：Config.vod().getId()
+        if (vodConfigVod != null && configGetId != null) {
+            try {
+                Object cfg = vodConfigVod.invoke(null);
+                if (cfg != null) {
+                    Object v = configGetId.invoke(cfg);
+                    if (v instanceof Number) return ((Number) v).intValue();
+                }
+            } catch (Throwable t) {
+                // 静默
+            }
+        }
+        // 候选2：标准 fongmi api.config.VodConfig.getCid()
+        try {
+            Class<?> vod = Class.forName(appPkg + ".api.config.VodConfig");
+            Method m = vod.getMethod("getCid");
+            Object v = m.invoke(null);
+            if (v instanceof Number) return ((Number) v).intValue();
+        } catch (Throwable t) {
+            // 静默
+        }
+        return -1;
+    }
+
+    /** 解析当前源配置的 cid（带日志，供初始化锚定时使用）。取不到返回 -1。 */
     private int currentCid() {
         String appPkg = appPackage();
         // 候选1（优先，因为宿主是 OK影视 等魔改壳，日志证实 Config.vod() 反射成功）：Config.vod().getId()
@@ -246,8 +281,9 @@ public class WatchSync {
                 if (cfg != null) {
                     Object v = configGetId.invoke(cfg);
                     if (v instanceof Number) {
-                        Logger.log("WatchSync > currentCid: 候选1 Config.vod().getId()=" + v);
-                        return ((Number) v).intValue();
+                        int id = ((Number) v).intValue();
+                        Logger.log("WatchSync > currentCid: 候选1 Config.vod().getId()=" + id);
+                        return id;
                     }
                 }
             } catch (Throwable t) {
@@ -260,14 +296,46 @@ public class WatchSync {
             Method m = vod.getMethod("getCid");
             Object v = m.invoke(null);
             if (v instanceof Number) {
-                Logger.log("WatchSync > currentCid: 候选2 VodConfig.getCid()=" + v);
-                return ((Number) v).intValue();
+                int id = ((Number) v).intValue();
+                Logger.log("WatchSync > currentCid: 候选2 VodConfig.getCid()=" + id);
+                return id;
             }
         } catch (Throwable t) {
             Logger.log("WatchSync > currentCid: 候选2 失败: " + t);
         }
         Logger.log("WatchSync > currentCid: 无可用反射，返回 -1");
         return -1;
+    }
+
+    /**
+     * cid 防护（fail-closed）：锚定失败(anchorCid<0)，或探测到当前源 cid 已偏离锚定 cid 时，返回 true。
+     * 返回 true 时调用方应<b>整体跳过本轮</b>——不读本地、不读远端、不写远端、不生成墓碑、不动任何基线。
+     * 锚定 cid 恒定不变，currentCid 随切换源变化；偏离即跳过，纯保险丝，零副作用。
+     */
+    private boolean shouldSkipCid(String who) {
+        if (anchorCid < 0) {                         // 锚定失败：fail-closed，绝不动本地/远端
+            if (!cidBlocked) logCidBlock(who, true);
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastProbeAt > CID_PROBE_MS) {      // 静默探测 + 节流，避免高频反射
+            lastProbeAt = now;
+            lastProbeCid = probeCidQuiet();
+        }
+        boolean blocked = (lastProbeCid != anchorCid);
+        if (blocked != cidBlocked) logCidBlock(who, blocked);
+        return blocked;
+    }
+
+    /** 只在 cid 阻塞状态翻转时打一条日志，避免每轮刷屏。 */
+    private boolean logCidBlock(String who, boolean blocked) {
+        cidBlocked = blocked;
+        if (blocked) {
+            Logger.log("WatchSync > " + who + ": cid 已切换/锚定失败（锚定=" + anchorCid + "，当前=" + lastProbeCid + "），本轮跳过，不动本地/远端");
+        } else {
+            Logger.log("WatchSync > " + who + ": cid 恢复一致（锚定=" + anchorCid + "，当前=" + lastProbeCid + "），恢复同步");
+        }
+        return blocked;
     }
 
     /** 由已解析 History 类反推宿主应用包名（截掉 ".bean.History" 后缀）。 */
@@ -313,6 +381,7 @@ public class WatchSync {
      */
     private void pollLocal() {
         try {
+            if (shouldSkipCid("pollLocal")) return;
             List<?> local = localHistoryFull();
             List<String> sig = snapshotOf(local);
             if (!sig.equals(lastSnapshot)) {
@@ -362,6 +431,7 @@ public class WatchSync {
      */
     private void pullAndPush() {
         try {
+            if (shouldSkipCid("pullAndPush")) return;
             // ===== 1. 读本地记录（本实例锚定 cid 分区），与 localSnap 对比，生成墓碑（立即）=====
             List<?> local = localHistoryFull();                    // 只含锚定 cid 的记录
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名
@@ -641,7 +711,7 @@ public class WatchSync {
 
     /**
      * 本机全量历史对象（cid 锚定）：SQLite 直读全表，按记录自带的 cid 过滤到<b>本实例锚定的 cid 分区</b>。
-     * 即 {@code SELECT * FROM History WHERE cid = 锚定cid}；锚定失败(anchorCid<0)时退化为全表。
+     * 即 {@code SELECT * FROM History WHERE cid = 锚定cid}；锚定失败(anchorCid<0)时 fail-closed 返回空（入口已由 shouldSkipCid 拦截，此处兜底）。
      * 天然避开 {@code History.get()} 的 LIMIT 60 截断，也不受 cid 视图漂移影响（过滤条件恒定为锚定 cid）。
      */
     private List<Object> localHistoryFull() {
@@ -666,11 +736,12 @@ public class WatchSync {
                 Logger.log("WatchSync > SQLite 直读 反射 boolean 字段失败: " + t);
             }
             db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READONLY);
-            // 全量读表，按记录自带的 cid 过滤到本实例锚定的 cid 分区（anchorCid < 0 表示锚定失败，退化为全表）
+            // 全量读表，按记录自带的 cid 过滤到本实例锚定的 cid 分区；anchorCid<0（锚定失败）fail-closed 返回空
             if (anchorCid >= 0) {
                 cur = db.rawQuery("SELECT * FROM History WHERE cid = ?", new String[]{String.valueOf(anchorCid)});
             } else {
-                cur = db.rawQuery("SELECT * FROM History", null);
+                Logger.log("WatchSync > localHistoryFull: 锚定失败(anchorCid<0) fail-closed 返回空，不同步");
+                return out;
             }
             String[] cols = cur.getColumnNames();
             while (cur.moveToNext()) {
@@ -803,6 +874,7 @@ public class WatchSync {
     /** 读取远端同步文件全文；读取失败返回 null（调用方自行区分空文件与失败）。 */
     private String readRemote() {
         try {
+            if (shouldSkipCid("readRemote")) return null;
             String out = drive.exec("cat \"" + syncPath + "\"");
             if (out == null) {
                 Logger.log("WatchSync > readRemote: 远端返回 null");
@@ -821,6 +893,7 @@ public class WatchSync {
      */
     private void writeRemote(String json) {
         try {
+            if (shouldSkipCid("writeRemote")) return;
             String b64 = android.util.Base64.encodeToString(json.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
             String cmd = "printf '%s' '" + b64 + "' | base64 -d > \"" + syncPath + ".tmp\" && mv \"" + syncPath + ".tmp\" \"" + syncPath + "\"";
             String res = drive.exec(cmd);

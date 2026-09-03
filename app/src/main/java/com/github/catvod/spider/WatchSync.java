@@ -53,12 +53,14 @@ import java.util.concurrent.TimeUnit;
  *   <li>墓碑带 {@link #TOMBSTONE_TTL_MS} 有效期，过期不再写回远端，避免无限累积。</li>
  * </ol>
  *
- * <p><b>防护模型（url.user + username，cid 已弃用）</b></p>
+ * <p><b>锚定模型（cid + username 锁死）</b></p>
  * <ul>
- *   <li>实例用 <b>username</b>（远端文件名分隔）锁定用户身份。</li>
- *   <li>任何本地/远端读写前，先把当前源配置 <b>url 的 {@code user=} 参数</b>与实例 username 对比（{@link #userMismatch}）；
- *       不一致（切到别的用户/源、或取不到 user）→ 立即<b>停机（不自愈）</b>，绝对不读/不写/不拍快照/不打墓碑，防跨用户串台与误删。</li>
- *   <li>0.5s {@link #monitorUser} 探针纯兜底：覆盖「先进 AListSh 再切到非 AListSh」等不走 homeContent 的场景，同样停机不自愈。</li>
+ *   <li>每 <b>一个 AListSh 实例对应一个 sync 实例</b>（不单例）：宿主里每个配置一个 AListSh，天然每配置一个 sync。</li>
+ *   <li>sync 在 <b>homeContent 初始化时</b>解析并<b>锚定</b>当前 {@code cid} 与 {@code username}（此刻 cid 可靠稳定），
+ *       实例整个生命周期锁死在这两个值上，不再二次读取。</li>
+ *   <li>远端文件按锚定的 username 隔离存取（watch.&lt;user&gt;.txt）。</li>
+ *   <li>读本地记录：SQLite 全量读表后按<b>记录自带的 cid</b> 过滤（{@code WHERE cid = 锚定cid}），
+ *       基线(墓碑判定)永远在同一 cid 分区内比较——切源即换 AListSh 实例、换 sync，互不污染，杜绝误删。</li>
  * </ul>
  */
 public class WatchSync {
@@ -72,15 +74,11 @@ public class WatchSync {
     private static final long PULL_PERIOD_SEC = 30;
     /** 墓碑有效期（毫秒）：超过该时长不再写回远端，避免墓碑无限累积。 */
     private static final long TOMBSTONE_TTL_MS = 60L * 24 * 60 * 60 * 1000; // 60 天
-    /** user 探针周期（毫秒）：纯兜底，检测已离开 AListSh / 切到别的用户 url 时立即停机（不自愈）。 */
-    private static final long USER_PROBE_MS = 500;
-
-    /** 进程内单例：反复 start() 只维护一个实例（url.user 变时停机重建、一致时复用）。 */
-    private static volatile WatchSync instance;
-
     private final Context context;
     private final Drive drive;
     private final String username;
+    /** 锚定的源 cid：homeContent 初始化时取一次并锁死，本地历史只同步该 cid 分区。 */
+    private int anchorCid = -1;
     /** 远端同步文件路径（已按用户名隔离）。 */
     private final String syncPath;
 
@@ -90,9 +88,6 @@ public class WatchSync {
     private List<String> lastSnapshot = Collections.emptyList();
     /** 本机上次同步后的历史片名集合（仅内存、不持久化），用于与当前本地对比生成删除墓碑。 */
     private final Set<String> localSnap = new HashSet<>();
-
-    /** 是否已停止（停机后不再读/写/拍快照/打墓碑，等下次 homeContent 用新的用户态重建）。 */
-    private volatile boolean stopped;
 
     // ---------------- 反射缓存 ----------------
     // 由于 WatchSync 是 spider 插件，运行在宿主播放器内，History 等类是宿主应用的，
@@ -109,7 +104,7 @@ public class WatchSync {
     private Method histGetDuration;         // History.getDuration()（可为 null）
 
     private Method vodConfigVod;            // 候选2: Config.vod() -> 当前 vod 配置实例（OK影视等魔改壳）
-    private Method configGetUrl;            // 候选2: Config.getUrl() -> 源配置 url（跨设备稳定，用于解析 user=）
+    private Method configGetId;             // 候选2: Config.getId() -> 当前配置 id（即锚定的 cid）
 
     /** 远端解析结果。 */
     private static class RemoteData {
@@ -148,16 +143,14 @@ public class WatchSync {
     }
 
     /**
-     * 启动同步（进程内单例）。由 AListSh.homeContent 每次切入时调用。
-     * <ul>
-     *   <li><b>当前源 url.user 与实例 username 一致且未停机</b> → 直接复用，不重建；</li>
-     *   <li><b>url.user 变了</b>（= 切到另一个用户/源，或取不到 user）→ 立即停止旧实例并全新重建；</li>
-     *   <li><b>兜底 0.5s user 探针</b>检测到已离开 AListSh（url.user 变，或取不到 user）→ 直接停机不自愈。</li>
-     * </ul>
+     * 创建同步实例（每 AListSh 实例一个，不单例）。由 AListSh.homeContent 首次进入时调用。
+     * <p>关键：在此初始化阶段解析并<b>锚定</b>当前源 cid（此刻 cid 可靠稳定），实例整个生命周期
+     * 锁死在这个 cid + username 上，本地历史只读该 cid 分区，切源即换 AListSh 实例、换 sync，互不污染。</p>
+     * <p>无停机/重建逻辑（不再判定 url.user）：每实例天然锚定，关机/切换由宿主换实例完成。</p>
      *
-     * @return 启动成功的单例；条件不满足返回 null（静默降级，不影响播放器）。
+     * @return 创建成功的实例；条件不满足返回 null（静默降级，不影响播放器）。
      */
-    public static WatchSync start(Context context, Drive drive) {
+    public static WatchSync create(Context context, Drive drive) {
         try {
             if (drive == null) {
                 Logger.log("WatchSync > 未启用：defaultDrive 为空");
@@ -169,46 +162,17 @@ public class WatchSync {
                 Logger.log("WatchSync > 未启用：syncWatch=false 或 syncPath 为空");
                 return null;
             }
-            synchronized (WatchSync.class) {
-                WatchSync cur = instance;
-                // 当前源 url.user 与实例 username 一致且未停机 → 复用，不重建
-                if (cur != null && !cur.stopped && cur.sameActiveUser()) {
-                    Logger.log("WatchSync > 当前用户(url.user) 一致，复用现有实例（user=" + cur.username + "）");
-                    return cur;
-                }
-                // 需要停机重建：url.user 不一致 / 已停机 / 取不到 user
-                if (cur != null) {
-                    Logger.log("WatchSync > 当前用户不一致/需重建：停止旧实例");
-                    cur.stop();
-                }
-                // 全新创建
-                WatchSync ws = new WatchSync(context, drive, drive.getUsername(), drive.getSyncPath());
-                ws.initReflection();
-                ws.schedule();
-                ws.scheduler.execute(ws::pullAndPush);
-                ws.scheduler.execute(ws::refreshLocalSnap);
-                instance = ws;
-                Logger.log("WatchSync > 启动完成：全新实例 user=" + ws.username);
-                return ws;
-            }
+            WatchSync ws = new WatchSync(context, drive, drive.getUsername(), drive.getSyncPath());
+            ws.initReflection();               // 内部解析并锚定 cid
+            ws.schedule();
+            ws.scheduler.execute(ws::pullAndPush);
+            ws.scheduler.execute(ws::refreshLocalSnap);
+            Logger.log("WatchSync > 创建完成：new 实例 user=" + ws.username + " 锚定cid=" + ws.anchorCid);
+            return ws;
         } catch (Throwable t) {
-            Logger.log("WatchSync > start failed: " + t);
+            Logger.log("WatchSync > create failed: " + t);
             return null;
         }
-    }
-
-    /** 停机：停止调度、清空内部状态，等待下次 homeContent 重建。停机后不再读/写远端、不拍快照、不打墓碑。 */
-    private void stop() {
-        if (stopped) return;
-        stopped = true;
-        try {
-            scheduler.shutdownNow();
-        } catch (Throwable t) {
-            Logger.log("WatchSync > stop: 关闭 scheduler 异常: " + t);
-        }
-        localSnap.clear();
-        lastSnapshot = Collections.emptyList();
-        Logger.log("WatchSync > 已停机（user=" + username + "），清空快照，等待 homeContent 重建");
     }
 
     /** 初始化全部反射缓存。失败的方法置空或抛出，由上层兜底。 */
@@ -249,24 +213,61 @@ public class WatchSync {
         // 按名反射拿不到 findAll；而 SQLiteDatabase 是系统组件不混淆，直接 SELECT * FROM History 即可，
         // 不再初始化 appDb/daoGetter/daoFindAll。History bean 的反射仍保留（objectFrom/sync 等沿用）。
 
-        // 候选2（OK影视等魔改壳）：com.fongmi.android.tv.bean.Config.vod() + getUrl()
-        // url 是该源配置的稳定标识，用于解析 user= 参数做跨用户防护。
+        // 候选2（OK影视等魔改壳）：com.fongmi.android.tv.bean.Config.vod() + getId()
+        // id 即为当前配置/源的 cid，homeContent 初始化时此刻可靠，取一次并锚定到 anchorCid。
         try {
             Class<?> cfg = Class.forName(appPkg + ".bean.Config");
             vodConfigVod = cfg.getMethod("vod");
             try {
-                configGetUrl = cfg.getMethod("getUrl");
+                configGetId = cfg.getMethod("getId");
             } catch (Throwable t) {
-                configGetUrl = null;
+                configGetId = null;
             }
             Logger.log("WatchSync > 候选2 Config.vod() 反射成功: className=" + cfg.getName() + " vod=" + vodConfigVod
-                    + " getUrl=" + (configGetUrl != null));
+                    + " getId=" + (configGetId != null));
         } catch (Throwable t) {
             vodConfigVod = null;
-            configGetUrl = null;
+            configGetId = null;
             Logger.log("WatchSync > 候选2 Config.vod() 反射失败: " + t);
         }
+        // 锚定当前源 cid（仅此处读取一次）：Config.vod().getId()
+        anchorCid = currentCid();
+        Logger.log("WatchSync > 锚定 cid=" + anchorCid + " user=" + this.username + "（实例生命周期锁死）");
         Logger.log("WatchSync > initReflection 完成：本实例 user=" + this.username);
+    }
+
+    /** 解析当前源配置的 cid（多候选反射）：候选1 api.config.VodConfig.getCid()；候选2 Config.vod().getId()。取不到返回 -1。 */
+    private int currentCid() {
+        String appPkg = appPackage();
+        // 候选1（优先，因为宿主是 OK影视 等魔改壳，日志证实 Config.vod() 反射成功）：Config.vod().getId()
+        if (vodConfigVod != null && configGetId != null) {
+            try {
+                Object cfg = vodConfigVod.invoke(null);
+                if (cfg != null) {
+                    Object v = configGetId.invoke(cfg);
+                    if (v instanceof Number) {
+                        Logger.log("WatchSync > currentCid: 候选1 Config.vod().getId()=" + v);
+                        return ((Number) v).intValue();
+                    }
+                }
+            } catch (Throwable t) {
+                Logger.log("WatchSync > currentCid: 候选1 失败: " + t);
+            }
+        }
+        // 候选2：标准 fongmi api.config.VodConfig.getCid()
+        try {
+            Class<?> vod = Class.forName(appPkg + ".api.config.VodConfig");
+            Method m = vod.getMethod("getCid");
+            Object v = m.invoke(null);
+            if (v instanceof Number) {
+                Logger.log("WatchSync > currentCid: 候选2 VodConfig.getCid()=" + v);
+                return ((Number) v).intValue();
+            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > currentCid: 候选2 失败: " + t);
+        }
+        Logger.log("WatchSync > currentCid: 无可用反射，返回 -1");
+        return -1;
     }
 
     /** 由已解析 History 类反推宿主应用包名（截掉 ".bean.History" 后缀）。 */
@@ -312,9 +313,6 @@ public class WatchSync {
      */
     private void pollLocal() {
         try {
-            if (stopped) return;
-            // 读写前 user 守卫：url.user 与 username 不一致 → 停机并放弃本轮
-            if (userMismatch("轮询")) return;
             List<?> local = localHistoryFull();
             List<String> sig = snapshotOf(local);
             if (!sig.equals(lastSnapshot)) {
@@ -342,86 +340,12 @@ public class WatchSync {
 
     /**
      * 注册周期任务：
-     *   - 0.5 秒 user 探针（兜底停机）；
      *   - 本地 3 秒轮询；
      *   - 定时 30 秒拉取远端。
      */
     private void schedule() {
-        scheduler.scheduleWithFixedDelay(this::monitorUser, USER_PROBE_MS, USER_PROBE_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(this::pollLocal, PUSH_POLL_MS, PUSH_POLL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(() -> pullAndPush(), PULL_PERIOD_SEC, PULL_PERIOD_SEC, TimeUnit.SECONDS);
-    }
-
-    /**
-     * 0.5s user 探针（纯兜底）：覆盖「先进 AListSh 再切到非 AListSh」场景。
-     * 此时不走 AListSh 的 homeContent，只能靠探针检测 url.user 变化 / 取不到。
-     * 一旦 url.user 与实例 username 不一致（或取不到）→ 立即停机（不自愈），
-     * 等下次切回 AListSh 由 homeContent 调 start() 重新初始化。
-     */
-    private void monitorUser() {
-        try {
-            if (stopped) return;
-            userMismatch("探针兜底"); // 不一致/取不到 → 停机并放弃
-        } catch (Throwable t) {
-            Logger.log("WatchSync > [user探针兜底] err: " + t);
-        }
-    }
-
-    /**
-     * 当前源 url.user 是否与实例锁定的 username 一致。取不到 user（null/空）视为不一致，
-     * 交由探针尽快停机；用于 start() 的复用/重建判断。
-     */
-    private boolean sameActiveUser() {
-        String cur = currentConfigUser();
-        if (cur == null || cur.isEmpty()) return false;
-        return cur.equals(this.username);
-    }
-
-    /**
-     * 同步守卫：本地/远端读写前，用当前源 url 的 user 参数与实例 username 对比。
-     * 不一致（切到了别的用户/源，或取不到 user）→ 停机并重置，防止跨用户读写/串台/误删。
-     *
-     * @param who 调用方标识（用于日志）
-     * @return true 表示应放弃本轮
-     */
-    private boolean userMismatch(String who) {
-        if (stopped) return true;
-        String cur = currentConfigUser();
-        if (cur == null || cur.isEmpty()) {
-            Logger.log("WatchSync > [user守卫/" + who + "] 无法从 url 取到 user（cur=" + cur + "）→ 停机并放弃本轮");
-            stop();
-            return true;
-        }
-        if (!cur.equals(this.username)) {
-            Logger.log("WatchSync > [user守卫/" + who + "] url.user=[" + cur + "] 与 username=[" + this.username + "] 不一致 → 停机并放弃本轮（防跨用户读写）");
-            stop();
-            return true;
-        }
-        return false;
-    }
-
-    /** 从当前源配置 url 解析 user 参数（如 t.json?user=zengge99 → "zengge99"）；取不到返回 null。 */
-    private String currentConfigUser() {
-        if (configGetUrl == null || vodConfigVod == null) {
-            Logger.log("WatchSync > [user] vod/configGetUrl 反射不可用");
-            return null;
-        }
-        try {
-            Object cfg = vodConfigVod.invoke(null);
-            if (cfg == null) return null;
-            Object urlObj = configGetUrl.invoke(cfg);
-            if (urlObj == null) return null;
-            String url = urlObj.toString();
-            int i = url.indexOf("user=");
-            if (i < 0) return null;
-            String rest = url.substring(i + 5);
-            int amp = rest.indexOf('&');
-            String user = amp < 0 ? rest : rest.substring(0, amp);
-            return user.isEmpty() ? null : user;
-        } catch (Throwable t) {
-            Logger.log("WatchSync > [user] 解析 url 异常: " + t);
-            return null;
-        }
     }
 
     // -------------------- 统一同步流程 pullAndPush --------------------
@@ -438,11 +362,8 @@ public class WatchSync {
      */
     private void pullAndPush() {
         try {
-            if (stopped) return;
-            // 读写前 user 守卫：url.user 与 username 不一致 → 停机并放弃本轮
-            if (userMismatch("同步")) return;
-            // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑（立即）=====
-            List<?> local = localHistoryFull();                    // 本机全量（不过滤 cid/url）
+            // ===== 1. 读本地记录（本实例锚定 cid 分区），与 localSnap 对比，生成墓碑（立即）=====
+            List<?> local = localHistoryFull();                    // 只含锚定 cid 的记录
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名
             for (Object o : local) {
                 String n = vodNameOf(o);
@@ -719,9 +640,9 @@ public class WatchSync {
     }
 
     /**
-     * 本机全量历史对象（方案 A：<b>不过滤 cid/url</b>，本机该用户的全部历史都参与同步）。
-     * 优先走 AppDatabase.findAll() 反射 —— 这才是“本机全集”，不会像 get() 那样被 LIMIT 60 截断。
-     * cid 在跨设备/跨源下不可靠，已弃用，不再按源过滤。
+     * 本机全量历史对象（cid 锚定）：SQLite 直读全表，按记录自带的 cid 过滤到<b>本实例锚定的 cid 分区</b>。
+     * 即 {@code SELECT * FROM History WHERE cid = 锚定cid}；锚定失败(anchorCid<0)时退化为全表。
+     * 天然避开 {@code History.get()} 的 LIMIT 60 截断，也不受 cid 视图漂移影响（过滤条件恒定为锚定 cid）。
      */
     private List<Object> localHistoryFull() {
         List<Object> out = new ArrayList<>();
@@ -745,7 +666,12 @@ public class WatchSync {
                 Logger.log("WatchSync > SQLite 直读 反射 boolean 字段失败: " + t);
             }
             db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READONLY);
-            cur = db.rawQuery("SELECT * FROM History", null);
+            // 全量读表，按记录自带的 cid 过滤到本实例锚定的 cid 分区（anchorCid < 0 表示锚定失败，退化为全表）
+            if (anchorCid >= 0) {
+                cur = db.rawQuery("SELECT * FROM History WHERE cid = ?", new String[]{String.valueOf(anchorCid)});
+            } else {
+                cur = db.rawQuery("SELECT * FROM History", null);
+            }
             String[] cols = cur.getColumnNames();
             while (cur.moveToNext()) {
                 JSONObject j = new JSONObject();
@@ -877,8 +803,6 @@ public class WatchSync {
     /** 读取远端同步文件全文；读取失败返回 null（调用方自行区分空文件与失败）。 */
     private String readRemote() {
         try {
-            // 远端读前 user 守卫：url.user 与 username 不一致 → 停机并放弃
-            if (userMismatch("远端读")) return null;
             String out = drive.exec("cat \"" + syncPath + "\"");
             if (out == null) {
                 Logger.log("WatchSync > readRemote: 远端返回 null");
@@ -897,8 +821,6 @@ public class WatchSync {
      */
     private void writeRemote(String json) {
         try {
-            // 远端写前 user 守卫：url.user 与 username 不一致 → 停机并放弃（绝不写错用户文件）
-            if (userMismatch("远端写")) return;
             String b64 = android.util.Base64.encodeToString(json.getBytes(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP);
             String cmd = "printf '%s' '" + b64 + "' | base64 -d > \"" + syncPath + ".tmp\" && mv \"" + syncPath + ".tmp\" \"" + syncPath + "\"";
             String res = drive.exec(cmd);

@@ -94,11 +94,14 @@ public class AListSh extends Spider {
     @Override
     public String homeContent(boolean filter) throws Exception {
         fetchRule();
-        // 观看记录多端同步（单例 + url.user 防护）：切源必进 homeContent，在此重建/复用（cid 已弃用）。
-        try {
-            watchSync = WatchSync.start(mContext, defaultDrive);
-        } catch (Throwable t) {
-            Logger.log("AListSh > WatchSync.start err: " + t);
+        // 观看记录多端同步：每 AListSh 实例一个 sync，homeContent 首次进入时懒创建并锚定 cid+username。
+        // 不放 start() 静态单例了：实例自持 watchSync 字段，同实例复用，切配置=换 AListSh=换 sync。
+        if (watchSync == null) {
+            try {
+                watchSync = WatchSync.create(mContext, defaultDrive);
+            } catch (Throwable t) {
+                Logger.log("AListSh > WatchSync.create err: " + t);
+            }
         }
         List<Class> classes = new ArrayList<>();
         for (Drive drive : drives)

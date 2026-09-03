@@ -9,8 +9,12 @@ import org.json.JSONObject;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -244,15 +248,18 @@ public class WatchSync {
             Logger.log("WatchSync > History.delete() 反射失败，将无法在本地执行墓碑删除: " + t);
         }
 
-        // AppDatabase.get().getHistoryDao().findAll()：取本机全量历史（避开 get() 的 LIMIT 60 截断）。
-        // 真机 AppDatabase 可能因混淆/改签名找不到 get()，故做多候选兼容：
-        //   优先试 AppDatabase，再试 Room 生成的 AppDatabase_Impl；
-        //   单例方法先 getMethod 再回退 getDeclaredMethod（连私有/包级也能拿）；
-        //   DAO 方法在实例上按返回类型扫；findAll 在 DAO 实现上找“无参返回 List”的方法。
-        // 任何一步失败都整体降级为 get() 兜底，不影响主流程。
+        // AppDatabase 全量读取 findAll()：结构性反射（不依赖混淆后的方法名）。
+        // 反编译确认：OK影视 R8 保留 AppDatabase 类名，但 get()→n()、getHistoryDao()→r()、各类改名、DAO 类型混淆成 q3/*。
+        // 因此改为扫描结构特征：
+        //   1) 单例 = AppDatabase 上「static 无参、返回类型是 AppDatabase/RoomDatabase」的方法；
+        //   2) DAO getter = 实例「无参、返回类型非基本类型/String/集合/AppDatabase 本身」的方法（DAO 是 final class，非接口）；
+        //   3) findAll = 该 DAO 上「无参、返回 List，且泛型元素是 History」的方法。
+        // 任何一步失败都整体降级为 get() 兑底，不影响主流程。
+        // 每步日志用 [findAll] 前缀，方便从 log.txt 定位卡在哪一步。
         appDb = null;
         daoGetter = null;
         daoFindAll = null;
+        Logger.log("WatchSync > [findAll] 开始结构性反射（appPkg=" + appPkg + " historyClass=" + historyClass.getName() + "）");
         try {
             Class<?> dbCls = null;
             for (String c : new String[]{appPkg + ".db.AppDatabase", appPkg + ".db.AppDatabase_Impl"}) {
@@ -262,55 +269,92 @@ public class WatchSync {
                 } catch (Throwable ignored) {
                 }
             }
+            Logger.log("WatchSync > [findAll] dbCls=" + (dbCls == null ? "null" : dbCls.getName()));
             if (dbCls != null) {
-                for (String m : new String[]{"get", "getInstance", "getDatabase", "getDb"}) {
-                    Method mm = null;
-                    try {
-                        mm = dbCls.getMethod(m);
-                    } catch (Throwable ignored) {
-                    }
-                    if (mm == null) {
+                // 1) 结构性单例：static 无参、返回类型可赋给 AppDatabase
+                for (Method um : dbCls.getMethods()) {
+                    if (!Modifier.isStatic(um.getModifiers())) continue;
+                    if (um.getParameterCount() != 0) continue;
+                    Class<?> rt = um.getReturnType();
+                    if (rt == null) continue;
+                    if (rt == dbCls || dbCls.isAssignableFrom(rt)) {
                         try {
-                            mm = dbCls.getDeclaredMethod(m);
-                            if (mm != null) mm.setAccessible(true);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                    if (mm != null) {
-                        try {
-                            appDb = mm.invoke(null);
+                            appDb = um.invoke(null);
+                            Logger.log("WatchSync > [findAll] 单例方法=" + um.getName() + " -> " + (appDb == null ? "null" : appDb.getClass().getName()));
                             if (appDb != null) break;
-                        } catch (Throwable ignored) {
+                        } catch (Throwable t) {
+                            Logger.log("WatchSync > [findAll] 单例调用失败 " + um.getName() + ": " + t);
                         }
                     }
                 }
+                Logger.log("WatchSync > [findAll] appDb=" + (appDb == null ? "null" : appDb.getClass().getName()));
                 if (appDb != null) {
-                    for (Method me : appDb.getClass().getMethods()) {
-                        if (me.getParameterCount() != 0) continue;
-                        if (me.getName().toLowerCase().contains("historydao")) {
-                            daoGetter = me;
-                            break;
+                    // 2) 结构性 DAO getter：实例、无参、返回类型不是基本类型/String/集合/AppDatabase 本身。
+                    // 注意：反编译确认 OK影视 的 DAO 全是 final class（如 q3/n），不是 interface，
+                    // 因此不能用 isInterface() 过滤（否则会全滤掉），只能排除明显非 DAO 的返回类型。
+                    for (Method dm : appDb.getClass().getMethods()) {
+                        if (dm.getParameterCount() != 0) continue;
+                        Class<?> rt = dm.getReturnType();
+                        if (rt == null || rt.isPrimitive()) continue;
+                        if (rt == String.class || rt == Object.class) continue;
+                        if (Collection.class.isAssignableFrom(rt) || Map.class.isAssignableFrom(rt)) continue;
+                        if (rt == dbCls || dbCls.isAssignableFrom(rt)) continue; // 跳过单例自身/子类
+                        Object dao = null;
+                        try {
+                            dao = dm.invoke(appDb);
+                        } catch (Throwable t) {
+                            Logger.log("WatchSync > [findAll] DAO getter 调用失败 " + dm.getName() + ": " + t);
+                            continue;
                         }
-                    }
-                    if (daoGetter != null) {
-                        Object dao = daoGetter.invoke(appDb);
-                        if (dao != null) {
-                            for (Method me : dao.getClass().getMethods()) {
-                                if (me.getParameterCount() != 0) continue;
-                                if (!List.class.isAssignableFrom(me.getReturnType())) continue;
-                                String n = me.getName().toLowerCase();
-                                if (n.equals("findall") || n.equals("getall") || n.equals("loadall")) {
-                                    daoFindAll = me;
-                                    break;
+                        if (dao == null) continue;
+                        Logger.log("WatchSync > [findAll] 候选 DAO getter=" + dm.getName() + " 类型=" + rt.getName() + " 实例=" + dao.getClass().getName());
+                        // 3) 找该 DAO 上「无参返回 List<History>」的 findAll
+                        for (Method fm : dao.getClass().getMethods()) {
+                            if (fm.getParameterCount() != 0) continue;
+                            if (!List.class.isAssignableFrom(fm.getReturnType())) continue;
+                            boolean hit = false;
+                            // 3a) 泛型签名优先：getGenericReturnType() 若是 List<History> 则命中
+                            try {
+                                Type gt = fm.getGenericReturnType();
+                                if (gt instanceof ParameterizedType) {
+                                    Type[] args = ((ParameterizedType) gt).getActualTypeArguments();
+                                    if (args.length == 1 && args[0] instanceof Class) {
+                                        Class<?> elem = (Class<?>) args[0];
+                                        Logger.log("WatchSync > [findAll]   DAO[" + dm.getName() + "] 方法=" + fm.getName() + " 泛型实参=" + elem.getName() + " isHistory=" + historyClass.isAssignableFrom(elem));
+                                        if (historyClass.isAssignableFrom(elem)) hit = true;
+                                    }
+                                }
+                            } catch (Throwable t) {
+                                Logger.log("WatchSync > [findAll]   泛型解析失败 " + fm.getName() + ": " + t);
+                            }
+                            // 3b) 兑底：泛型被 R8 剥离时，invoke 看返回列表元素是否为 History 实例（findAll 是只读查询）
+                            if (!hit) {
+                                try {
+                                    Object res = fm.invoke(dao);
+                                    if (res instanceof List) {
+                                        for (Object o : (List<?>) res) {
+                                            if (o != null && historyClass.isInstance(o)) { hit = true; break; }
+                                        }
+                                        Logger.log("WatchSync > [findAll]   DAO[" + dm.getName() + "] 方法=" + fm.getName() + " invoke取回 " + ((List<?>) res).size() + " 条，isHistory=" + hit);
+                                    }
+                                } catch (Throwable t) {
+                                    Logger.log("WatchSync > [findAll]   invoke 验证失败 " + fm.getName() + ": " + t);
                                 }
                             }
+                            if (hit) {
+                                daoGetter = dm;
+                                daoFindAll = fm;
+                                Logger.log("WatchSync > [findAll] ★命中 HistoryDao.getter=" + dm.getName() + " findAll=" + fm.getName());
+                                break;
+                            }
                         }
+                        if (daoFindAll != null) break;
                     }
                 }
             }
-            Logger.log("WatchSync > AppDatabase.findAll 反射就绪: " + (daoFindAll != null));
+            Logger.log("WatchSync > [findAll] 结果: appDb=" + (appDb != null) + " daoGetter=" + (daoGetter != null) + " daoFindAll=" + (daoFindAll != null));
         } catch (Throwable t) {
-            Logger.log("WatchSync > AppDatabase 反射失败，将退化为 get() 兜底: " + t);
+            Logger.log("WatchSync > AppDatabase 反射失败，将退化为 get() 兑底: " + t);
         }
 
         // 候选2（OK影视等魔改壳）：com.fongmi.android.tv.bean.Config.vod() + getUrl()

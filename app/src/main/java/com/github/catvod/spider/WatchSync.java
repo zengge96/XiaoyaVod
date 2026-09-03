@@ -288,12 +288,16 @@ public class WatchSync {
         try {
             Class<?> vod = Class.forName(appPkg + ".api.config.VodConfig");
             vodGetCid = vod.getMethod("getCid");
+            Logger.log("WatchSync > VodConfig.getCid() 反射成功: className=" + vod.getName() + " method=" + vodGetCid
+                    + " 宿主App包=" + appPkg);
         } catch (Throwable t) {
             vodGetCid = null;
+            Logger.log("WatchSync > VodConfig.getCid() 反射失败，vodGetCid=null: " + t);
         }
         // 锁定本机播放源 cid：必须放在 initReflection 最末尾、vodGetCid 就绪之后取，
         // 否则 currentCid() 因 vodGetCid 为 null 返回 -1，导致下面的 guard 永远拦截、同步被关死。
         this.alistCid = currentCid();
+        Logger.log("WatchSync > initReflection 末尾锁定 alistCid(initCid)=" + this.alistCid);
     }
 
     /** 由已解析 History 类反推宿主应用包名（截掉 ".bean.History" 后缀）。 */
@@ -775,11 +779,24 @@ public class WatchSync {
 
     /** 当前播放源 id；反射不可用返回 -1（表示不过滤）。 */
     private int currentCid() {
-        if (vodGetCid == null) return -1;
+        if (vodGetCid == null) {
+            // 情况1：getCid 反射压根没找到（类或方法缺失）
+            Logger.log("WatchSync > [cid] currentCid: vodGetCid==null（反射未就绪），返回 -1");
+            return -1;
+        }
         try {
             Object v = vodGetCid.invoke(null);
-            return v instanceof Number ? ((Number) v).intValue() : -1;
+            if (v instanceof Number) {
+                int cid = ((Number) v).intValue();
+                // 情况4正常：返回具体数字，可能为 0 或正数
+                return cid;
+            }
+            // 情况3：返回了非数字类型
+            Logger.log("WatchSync > [cid] currentCid: getCid() 返回非数字类型: " + (v == null ? "null" : v.getClass().getName()) + " -> -1");
+            return -1;
         } catch (Throwable t) {
+            // 情况2：getCid() 内部抛异常（最可能是 VodConfig.getConfig() 为 null -> NPE，即播放器配置未加载）
+            Logger.log("WatchSync > [cid] currentCid: 调用 getCid() 抛异常 -> -1: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             return -1;
         }
     }

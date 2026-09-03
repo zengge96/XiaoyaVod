@@ -61,6 +61,10 @@ public class WatchSync {
     private static final long PULL_PERIOD_SEC = 30;
     /** 墓碑有效期（毫秒）：超过该时长不再写回远端，避免墓碑无限累积。 */
     private static final long TOMBSTONE_TTL_MS = 60L * 24 * 60 * 60 * 1000; // 60 天
+    /** cid 探针周期（毫秒）：高频监控当前播放源 cid 是否变化。 */
+    private static final long CID_PROBE_MS = 500;
+    /** cid 变化后的抑制期（毫秒）：必须满 15s 且 cid 回到 initCid 才恢复同步。 */
+    private static final long CID_SUPPRESS_MS = 15 * 1000;
 
     private final Context context;
     private final Drive drive;
@@ -75,8 +79,13 @@ public class WatchSync {
     /** 本机上次同步后的历史片名集合（仅内存、不持久化），用于与当前本地对比生成删除墓碑。 */
     private final Set<String> localSnap = new HashSet<>();
 
-    /** 用于记录AList配置的真实cid。 */
+    /** 用于记录AList配置的真实cid（初始化时锁定，同步只认这个 cid）。 */
     private int alistCid;
+    /** 是否处于 cid 抑制态：抑制期内不读取/不写入远端、不拍快照、不生成墓碑。
+     *  只在 cid 回到 initCid 且距最近一次变化满 15s 后恢复。 */
+    private volatile boolean cidSuppressed;
+    /** 最近一次检测到 cid 变化的时刻（毫秒）。 */
+    private volatile long lastCidChangeTime;
 
     // ---------------- 反射缓存 ----------------
     // 由于 WatchSync 是 spider 插件，运行在宿主播放器内，History 等类是宿主应用的，
@@ -153,8 +162,14 @@ public class WatchSync {
             }
             WatchSync ws = new WatchSync(context, drive, drive.getUsername(), drive.getSyncPath());
             ws.initReflection();
+            if (ws.alistCid <= 0) {
+                // 机制2：初始化时 cid 未知/取不到（含反射失败返回 -1）→ 整个同步停，避免在错误 cid 下误删
+                Logger.log("WatchSync > 停止同步：initCid 未知/取不到（initCid=" + ws.alistCid + "），不同步");
+                return null;
+            }
+            Logger.log("WatchSync > 锁定 initCid=" + ws.alistCid + "，本任务只同步这个 cid 的本地记录");
             ws.schedule();
-            // 启动先同步一次，让远端已有记录尽快并入本机
+            // 启动先同步一次，让远端已有记录尽快并入本机（首轮与当前逻辑等价，不抑制）
             ws.scheduler.execute(ws::pullAndPush);
             // 首次同步后初始化 localSnap 基线（记录后续用于生成删除墓碑的本地历史）
             // 用与“每次同步后更新”同一个函数 refreshLocalSnap()，保证初始与更新一致
@@ -324,8 +339,8 @@ public class WatchSync {
      */
     private void pollLocal() {
         try {
-            //如果配置切走了，不执行同步。
-            if (this.alistCid != currentCid()) {
+            // 守卫：cid 未知 / 抑制中 / 已切走 → 本轮跳过
+            if (shouldSkipSync("轮询")) {
                 return;
             }
 
@@ -356,12 +371,76 @@ public class WatchSync {
 
     /**
      * 注册周期任务：
+     *   - 0.5 秒 cid 探针（监控 cid 变化，变化时进入抑制并清快照）；
      *   - 本地 3 秒轮询（本机记录变化触发同步）；
      *   - 定时 30 秒拉取远端（统一走 pullAndPush）。
      */
     private void schedule() {
+        scheduler.scheduleWithFixedDelay(this::monitorCid, CID_PROBE_MS, CID_PROBE_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(this::pollLocal, PUSH_POLL_MS, PUSH_POLL_MS, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(() -> pullAndPush(), PULL_PERIOD_SEC, PULL_PERIOD_SEC, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 0.5s cid 探针：监控当前播放源 cid 是否变化或未知。
+     * 一旦发现变化（或 cid 取不到 <=0），清空本机快照并进入抑制态；
+     * 只有「cid 回到 initCid 且距最近一次变化已满 {@link #CID_SUPPRESS_MS}」才恢复并重建基线。
+     */
+    private void monitorCid() {
+        try {
+            long now = System.currentTimeMillis();
+            int cur = currentCid();
+            boolean changed = false;
+            if (cur <= 0) {
+                Logger.log("WatchSync > [cid探针] cid 未知/取不到 cur=" + cur + " initCid=" + alistCid + " → 视为变化，进入抑制");
+                changed = true;
+            } else if (cur != alistCid) {
+                Logger.log("WatchSync > [cid探针] cid 变化 cur=" + cur + " != initCid=" + alistCid + " → 进入抑制");
+                changed = true;
+            }
+            if (changed) {
+                lastCidChangeTime = now;
+                cidSuppressed = true;
+                localSnap.clear();
+                Logger.log("WatchSync > [cid探针] 已进入抑制：清空本机快照(localSnap=" + localSnap.size() + ")，" + CID_SUPPRESS_MS + "ms内不拍快照/不打墓碑(now=" + now + ")");
+                return;
+            }
+            // 到这里 cur == initCid（且 >0）
+            if (cidSuppressed) {
+                long elapsed = now - lastCidChangeTime;
+                if (elapsed >= CID_SUPPRESS_MS) {
+                    cidSuppressed = false;
+                    Logger.log("WatchSync > [cid探针] cid 回 initCid(" + cur + ") 且距变化已满 " + elapsed + "ms → 恢复同步，重建基线");
+                    refreshLocalSnap();
+                } else {
+                    Logger.log("WatchSync > [cid探针] 仍抑制：cid=" + cur + "==initCid 但距变化仅 " + elapsed + "ms(<" + CID_SUPPRESS_MS + "ms)，继续等待");
+                }
+            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > [cid探针] err: " + t);
+        }
+    }
+
+    /**
+     * 同步守卫：cid 未知 / 抑制中 / 已切走 → 返回 true（本轮 pullAndPush/pollLocal 应跳过）。
+     *
+     * @param who 调用方标识（用于日志）
+     */
+    private boolean shouldSkipSync(String who) {
+        int cur = currentCid();
+        if (cur <= 0) {
+            Logger.log("WatchSync > [" + who + "] 跳过：cid 未知 cur=" + cur + " initCid=" + alistCid);
+            return true;
+        }
+        if (cidSuppressed) {
+            Logger.log("WatchSync > [" + who + "] 跳过：抑制中（cid 变化未满" + CID_SUPPRESS_MS + "ms，lastCidChange=" + lastCidChangeTime + "）");
+            return true;
+        }
+        if (cur != alistCid) {
+            Logger.log("WatchSync > [" + who + "] 跳过：已切到其他源/配置 cur=" + cur + " != initCid=" + alistCid + "（本任务只同步 initCid）");
+            return true;
+        }
+        return false;
     }
 
     // -------------------- 统一同步流程 pullAndPush --------------------
@@ -378,8 +457,8 @@ public class WatchSync {
      */
     private void pullAndPush() {
         try {
-            //如果配置切走了，不执行同步。
-            if (this.alistCid != currentCid()) {
+            // 守卫：cid 未知 / 抑制中 / 已切走 → 本轮跳过
+            if (shouldSkipSync("同步")) {
                 return;
             }
             // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑 =====

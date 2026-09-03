@@ -428,6 +428,8 @@ public class WatchSync {
     private void pollLocal() {
         try {
             if (stopped) return;
+            // 读前 cid 守卫：cid 一翻转（切走）立即停机放弃，防跨用户误删
+            if (cidGuard("轮询")) return;
             List<?> local = localHistoryFull();
             List<String> sig = snapshotOf(local);
             if (!sig.equals(lastSnapshot)) {
@@ -479,12 +481,31 @@ public class WatchSync {
                 Logger.log("WatchSync > [探针兜底] cid 未知/取不到 cur=" + cur + " 实例cid=" + alistCid + " → 停机（不自愈）");
                 stop();
             } else if (cur != alistCid) {
-                Logger.log("WatchSync > [探针兜底] 检测到已离开 AListSh：实例cid=" + alistCid + " 当前=" + cur + " → 建成停机（不自愈，等 homeContent 重建）");
+                Logger.log("WatchSync > [探针兜底] 检测到已离开 AListSh：实例cid=" + alistCid + " 当前=" + cur + " → 停机（不自愈，等 homeContent 重建）");
                 stop();
             }
         } catch (Throwable t) {
             Logger.log("WatchSync > [探针兜底] err: " + t);
         }
+    }
+
+    /**
+     * 读前 cid 守卫：本机回退读取 History.get() 只认「当前 cid」。当 cid 翻转（切到另一用户 /
+     * 非 AListSh）的瞬间，在 0.5s 探针停机之前，pollLocal/pullAndPush 可能先执行，
+     * 此时 History.get() 读到的是「当前 cid」的记录（可能是空集），与旧 baseline 不同 → 全量误删。
+     * 因此每次真实读数据前先核对 currentCid()==本实例 alistCid，不符 → 停机并放弃本轮，绝不读/拍/写/删。
+     *
+     * @return true 表示应放弃本轮
+     */
+    private boolean cidGuard(String who) {
+        if (stopped) return true;
+        int cur = currentCid();
+        if (cur <= 0 || cur != this.alistCid) {
+            Logger.log("WatchSync > [守卫/" + who + "] 当前cid=" + cur + " 与实例cid=" + this.alistCid + " 不符 → 停机并放弃本轮（防跨用户误删）");
+            stop();
+            return true;
+        }
+        return false;
     }
 
     // -------------------- 统一同步流程 pullAndPush --------------------
@@ -502,6 +523,8 @@ public class WatchSync {
     private void pullAndPush() {
         try {
             if (stopped) return;
+            // 读前 cid 守卫：cid 一翻转（切走）立即停机放弃，防跨用户误删
+            if (cidGuard("同步")) return;
             // ===== 1. 读本地记录，与 localSnap 对比，生成墓碑 =====
             List<?> local = localHistoryFull();                    // 本机全量
             Set<String> currentLocal = new HashSet<>();            // 当前本机片名

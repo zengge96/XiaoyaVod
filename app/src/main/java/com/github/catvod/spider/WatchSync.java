@@ -1,6 +1,7 @@
 package com.github.catvod.spider;
 
 import android.content.Context;
+import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 
@@ -40,7 +41,7 @@ import java.util.concurrent.TimeUnit;
  *       </ul>
  *       兼容旧格式：若读到的是裸 JSON 数组，则当作 records 处理。</li>
  *   <li><b>统一流程 {@link #pullAndPush()}</b>：本地轮询（3 秒）检测到本机记录变化 / 定时（30 秒）都走它：
- *       读本地 → 与 {@code localSnap} 对比生成墓碑 → 读远端 → 「新者胜」合并（墓碑与记录比时间戳）→ 写回远端（含墓碑）→ 本地入库（historySync 增/改 + historyDel 删墓碑命中的）。</li>
+ *       读本地 → 与 {@code localSnap} 对比生成墓碑 → 读远端 → 「新者胜」合并（墓碑与记录比时间戳）→ 写回远端（含墓碑）→ 本地入库（SQL 直写 upsert + SQL 删除。</li>
  *   <li>本机全集通过 {@code AppDatabase.get().getHistoryDao().findAll()} 反射获取（<b>不过滤 cid/url</b>，
  *       本机该用户的全部历史都同步进他的 watch.&lt;user&gt;.txt）。cid 在跨设备/跨源下不可靠，已弃用。</li>
  * </ul>
@@ -101,15 +102,9 @@ public class WatchSync {
     // 由于 WatchSync 是 spider 插件，运行在宿主播放器内，History 等类是宿主应用的，
     // 因此一律通过反射调用，避免直接编译期依赖。
     private Class<?> historyClass;          // com.fongmi.android.tv.bean.History
-    private Method historyGet;              // History.get() -> 最近 60 条（仅作兜底）
-    private Method historyFindByName;       // History.findByName(String) -> List
-    private Method historyObjectFrom;       // History.objectFrom(String) -> History
-    private Method historySync;             // History.sync(List) -> void（只增/改，不删）
-    private Method histDel;                 // History.delete() -> History（删除单条本地记录）
+    private Method historyGet;              // History.get() -> 最近 60 条（仅兜底，读路径用）
+    private Method historyObjectFrom;       // History.objectFrom(String) -> History（读路径构造用）
     private Method histGetVodName;          // History.getVodName()
-    private Method histCanSave;             // History.canSave()（可为 null）
-    private Method histGetPosition;         // History.getPosition()（可为 null）
-    private Method histGetDuration;         // History.getDuration()（可为 null）
 
     private Method vodConfigVod;            // 候选2: Config.vod() -> 当前 vod 配置实例（OK影视等魔改壳）
     private Method configGetId;             // 候选2: Config.getId() -> 当前配置 id（即锚定的 cid）
@@ -192,29 +187,9 @@ public class WatchSync {
 
         // History 基础方法
         historyGet = historyClass.getMethod("get");
-        historyFindByName = historyClass.getMethod("findByName", String.class);
         historyObjectFrom = historyClass.getMethod("objectFrom", String.class);
-        historySync = historyClass.getMethod("sync", List.class);
         histGetVodName = historyClass.getMethod("getVodName");
-        try {
-            histCanSave = historyClass.getMethod("canSave");
-        } catch (Throwable t) {
-            histCanSave = null;
-        }
-        try {
-            histGetPosition = historyClass.getMethod("getPosition");
-            histGetDuration = historyClass.getMethod("getDuration");
-        } catch (Throwable t) {
-            histGetPosition = null;
-            histGetDuration = null;
-        }
-        // 删除操作：History.delete()（实例方法，按 cid+key 删单条）——用于把墓碑命中的本地记录删掉
-        try {
-            histDel = historyClass.getMethod("delete");
-        } catch (Throwable t) {
-            histDel = null;
-            Logger.log("WatchSync > History.delete() 反射失败，将无法在本地执行墓碑删除: " + t);
-        }
+        // 写本地已改为纯 SQLite 直写（见 applyLocal），不再反射 History.sync()/delete()/findByName()。
 
         // 本机全量历史改为 SQLite 直读（见 localHistoryFull()），不再走 AppDatabase/DAO 反射：
         // 反编译确认宿主 AppDatabase/DAO 被 R8 彻底混淆（get()→n()、findAll 改名、DAO→q3/*），
@@ -426,7 +401,7 @@ public class WatchSync {
      *   <li>读取远端记录（records + tombstones）；</li>
      *   <li>合并本地与远端（墓碑与记录都按「新者胜」比时间戳）；</li>
      *   <li>把合并结果写回远端（含墓碑，墓碑按 {@link #TOMBSTONE_TTL_MS} 裁剪）；</li>
-     *   <li>合并结果落到本地：墓碑命中的用 historyDel 删除，记录用 historySync 增/改。</li>
+     *   <li>合并结果落到本地：墓碑命中的用 SQL 删除，记录用 SQL 直写 upsert。</li>
      * </ol>
      */
     private void pullAndPush() {
@@ -493,51 +468,73 @@ public class WatchSync {
         }
     }
 
-    /** 把合并结果应用到本地：墓碑命中的删除，records 的用 historySync 增/改。结束后刷新 localSnap 基线。 */
+    /** 把合并结果应用到本地：墓碑命中用 SQL 直删，records 用 SQL 直写 upsert（不再走 bean 反射）。结束后刷新 localSnap 基线。 */
     private void applyLocal(RemoteData merged) {
-        // 5a. 墓碑命中 → 删除本地同名记录（historyDel）
-        if (histDel != null && !merged.tombstones.isEmpty()) {
-            for (String n : merged.tombstones.keySet()) {
-                try {
-                    Object locals = historyFindByName.invoke(null, n);
-                    List<?> list = locals == null ? new ArrayList<>() : (List<?>) locals;
-                    for (Object it : list) {
-                        histDel.invoke(it);
-                    }
-                    if (!list.isEmpty()) {
-                        Logger.log("WatchSync > 墓碑删除本地记录: " + n);
-                    }
-                } catch (Throwable t) {
-                    Logger.log("WatchSync > 墓碑删除本地 err (" + n + "): " + t);
+        SQLiteDatabase db = null;
+        try {
+            File dbf = context.getDatabasePath("tv");
+            if (dbf == null || !dbf.exists()) return;
+            db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READWRITE);
+            // 5a. 墓碑命中 → 删除本地同名记录（本锚定 cid 分区内）
+            if (!merged.tombstones.isEmpty()) {
+                for (String n : merged.tombstones.keySet()) {
+                    int del = db.delete("History", "cid = ? AND vodName = ?",
+                            new String[]{String.valueOf(anchorCid), n});
+                    if (del > 0) Logger.log("WatchSync > 墓碑删除本地记录: " + n + "（删 " + del + " 条）");
                 }
             }
-        }
-        // 5b. records → 入库（historySync 自带 createTime 新者胜 + 进度保护）
-        List<Object> mine = new ArrayList<>();
-        for (int i = 0; i < merged.records.length(); i++) {
-            JSONObject wrap = merged.records.optJSONObject(i);
-            if (wrap == null) continue;
-            JSONObject rec = wrap.optJSONObject("history");
-            if (rec == null) continue;
-            if (!canSafeMerge(rec)) continue;                        // 进度保护：无进度记录不覆盖本地有进度记录
-            try {
-                Object obj = historyObjectFrom.invoke(null, rec.toString());
-                if (obj != null) {
-                    mine.add(obj);
-                }
-            } catch (Throwable t) {
-                Logger.log("WatchSync > historyObjectFrom err: " + t);
+            // 5b. records → 直写 upsert（createTime 新者胜 + 进度保护；cid 强制锚定，杜绝 sync() 盖 VodConfig.getCid()）
+            for (int i = 0; i < merged.records.length(); i++) {
+                JSONObject wrap = merged.records.optJSONObject(i);
+                if (wrap == null) continue;
+                JSONObject rec = wrap.optJSONObject("history");
+                if (rec == null) continue;
+                if (!canSafeMerge(rec)) continue;                    // 进度保护：无进度记录不覆盖本地有进度记录
+                upsertHistory(db, rec);
             }
-        }
-        if (!mine.isEmpty()) {
-            try {
-                historySync.invoke(null, mine);
-            } catch (Throwable t) {
-                Logger.log("WatchSync > historySync err: " + t);
-            }
+        } catch (Throwable t) {
+            Logger.log("WatchSync > applyLocal err: " + t);
+        } finally {
+            if (db != null && db.isOpen()) try { db.close(); } catch (Throwable ignored) {}
         }
         // 应用完之后的本地库才是真基线 → 统一走 refreshLocalSnap()（与初始化同一函数）
         refreshLocalSnap();
+    }
+
+    /**
+     * 单条史实直写：本地已有同 key 且 createTime≥传入 则跳过（新者胜，不倒退进度），
+     * 否则 INSERT OR REPLACE 落库，cid 强制设为锚定值（与本分区读取口径一致）。
+     */
+    private void upsertHistory(SQLiteDatabase db, JSONObject rec) {
+        try {
+            String key = rec.optString("key");
+            if (key.isEmpty()) return;
+            long ctime = rec.optLong("createTime", 0L);
+            // 新者胜：本地已有同 key 且 createTime>=传入 → 不覆盖
+            try (Cursor c = db.rawQuery("SELECT createTime FROM History WHERE \"key\" = ?", new String[]{key})) {
+                if (c.moveToFirst() && c.getLong(0) >= ctime) return;
+            }
+            ContentValues cv = new ContentValues();
+            cv.put("key", key);
+            cv.put("cid", anchorCid);                                // 强制锚定 cid
+            cv.put("vodPic", rec.optString("vodPic"));
+            cv.put("vodName", rec.optString("vodName"));
+            cv.put("vodFlag", rec.optString("vodFlag"));
+            cv.put("vodRemarks", rec.optString("vodRemarks"));
+            cv.put("episodeUrl", rec.optString("episodeUrl"));
+            cv.put("revSort", rec.optBoolean("revSort", false) ? 1 : 0);   // Room: boolean 存 INTEGER(0/1)
+            cv.put("revPlay", rec.optBoolean("revPlay", false) ? 1 : 0);
+            cv.put("createTime", ctime);
+            cv.put("opening", rec.optLong("opening", 0L));
+            cv.put("ending", rec.optLong("ending", 0L));
+            cv.put("position", rec.optLong("position", 0L));
+            cv.put("duration", rec.optLong("duration", 0L));
+            cv.put("speed", (float) rec.optDouble("speed", 1.0));     // Room: float 存 REAL
+            cv.put("scale", rec.optInt("scale", -1));
+            db.insertWithOnConflict("History", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+        } catch (Throwable t) {
+            Logger.log("WatchSync > upsertHistory err: " + t);
+        }
     }
 
     /**
@@ -828,41 +825,36 @@ public class WatchSync {
 
     // ---------------- 进度保护 ----------------
 
-    /** 判断远端记录是否“有进度可保存”，用于进度保护。 */
-    private boolean hasProgress(Object hist) {
-        try {
-            if (histCanSave != null) return (Boolean) histCanSave.invoke(hist);
-            if (histGetPosition != null && histGetDuration != null) {
-                long pos = ((Number) histGetPosition.invoke(hist)).longValue();
-                long dur = ((Number) histGetDuration.invoke(hist)).longValue();
-                return pos >= 0 && dur > 0;
-            }
-            return true;
-        } catch (Throwable t) {
-            return true;
-        }
-    }
-
     /**
-     * 入库前的安全合并判断：
-     * 远端记录无进度（如仅点开未播放）时，不允许覆盖本机“已有进度”的同名记录，避免进度倒退。
+     * 入库前的安全合并判断（纯 JSON + SQLite，不再走 bean 反射）：
+     * 远端记录无进度（position<0 或 duration<=0，如仅点开未播放）时，
+     * 不允许覆盖本机“已有进度”的同名记录，避免进度倒退。
      */
     private boolean canSafeMerge(JSONObject rec) {
         try {
-            Object hist = historyObjectFrom.invoke(null, rec.toString());
-            if (hist == null) return true;
-            boolean remoteCanSave = hasProgress(hist);
-            if (remoteCanSave) return true;
-            String vodName = (String) histGetVodName.invoke(hist);
-            Object locals = historyFindByName.invoke(null, vodName);
-            if (locals == null) return true;
-            for (Object it : (List<?>) locals) {
-                if (hasProgress(it)) {
-                    Logger.log("WatchSync > 进度保护：无进度记录不覆盖本地有进度记录 name=" + vodName);
-                    return false;
+            long pos = rec.optLong("position", -1L);
+            long dur = rec.optLong("duration", 0L);
+            if (pos >= 0 && dur > 0) return true;                    // 远端有进度 → 可写
+            String vodName = rec.optString("vodName", "");
+            if (vodName.isEmpty()) return true;
+            SQLiteDatabase db = null;
+            try {
+                File dbf = context.getDatabasePath("tv");
+                if (dbf == null || !dbf.exists()) return true;
+                db = SQLiteDatabase.openDatabase(dbf.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+                try (Cursor c = db.rawQuery("SELECT position, duration FROM History WHERE cid = ? AND vodName = ?",
+                        new String[]{String.valueOf(anchorCid), vodName})) {
+                    while (c.moveToNext()) {
+                        if (c.getLong(0) >= 0 && c.getLong(1) > 0) {
+                            Logger.log("WatchSync > 进度保护：无进度记录不覆盖本地有进度记录 name=" + vodName);
+                            return false;
+                        }
+                    }
                 }
+                return true;
+            } finally {
+                if (db != null && db.isOpen()) try { db.close(); } catch (Throwable ignored) {}
             }
-            return true;
         } catch (Throwable t) {
             return true;
         }

@@ -19,6 +19,7 @@ import com.github.catvod.crawler.Spider;
 import com.github.catvod.net.OkHttp;
 import com.github.catvod.utils.Util;
 import com.github.catvod.utils.Image;
+import com.github.catvod.utils.Notify;
 import com.github.catvod.bean.alist.Pager;
 import org.json.JSONObject;
 import java.util.ArrayList;
@@ -70,6 +71,10 @@ public class AListSh extends Spider {
     private WatchSync watchSync;
 
     private Context mContext;
+
+    // A+C: 按服务器缓存登录 token, 同服务器缓存命中即短路去重, 避免启动阶段多线程重复登录
+    // token 有效期极长, 不做 TTL; 仅在服务端实际返回 401/403(失效) 时清缓存重新登录
+    private final Map<String, String> serverTokenCache = new HashMap<>();
 
     private String getRootCmd(Drive drive) {
         return drive.getCombinedMode() ? "{ cat index.combined.txt;echo ''; }" : "{ cat index.video.txt;echo ''; }";
@@ -462,36 +467,74 @@ public class AListSh extends Spider {
         } catch (Exception e) {
             Logger.log("post" + e);
         }
-        if (retry && (code == 401 || code == 403) && login(drive)) {
-            return post(drive, url, param, false);
+        if (retry && (code == 401 || code == 403)) {
+            if (login(drive)) {
+                String retryResp = post(drive, url, param, false);
+                // token 复用后仍 401/403 → 缓存 token 已失效, 清缓存供下次重新登录
+                try {
+                    int rc = new JSONObject(retryResp).getInt("code");
+                    if (rc == 401 || rc == 403) {
+                        serverTokenCache.remove(drive.getServer());
+                    }
+                } catch (Exception ignored) {
+                }
+                return retryResp;
+            }
         }
         return response;
     }
 
     private synchronized boolean login(Drive drive) {
+        // A+C: 同一服务器已有缓存 token → 直接复用, 不再重复登录/二次验证; 无 TTL, 失效由服务端 401/403 触发
+        String server = drive.getServer();
+        String cached = serverTokenCache.get(server);
+        if (cached != null && !cached.isEmpty()) {
+            drive.setToken(cached);
+            for (Drive d : drives) {
+                if (d.getServer().equals(server)) {
+                    d.setToken(cached);
+                }
+            }
+            return true;
+        }
         boolean result = loginByConfig(drive) || loginByFile(drive) || loginByUser(drive);
         if (!result) {
             return false;
         }
         //即便登陆成功也要再次验证，比如guest登陆成功，但是结果还是401
         int code = 200;
+        String errMsg = "";
         try {
             String path = "/";
             JSONObject params = drive.getParamByPath(path);
             params.put("path", path);
             String response = post(drive, drive.listApi(), params.toString(), false);
-            code = new JSONObject(response).getInt("code");
+            JSONObject json = new JSONObject(response);
+            code = json.getInt("code");
+            if (code != 200) {
+                errMsg = json.optString("message", "");
+            }
         } catch (Exception e) {
         }
         if (code == 401 || code == 403) {
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
             Path.write(loginFile, "\n\n");
+            serverTokenCache.remove(server); // 真登录后二次验证仍失败 → 清缓存, 避免下次误复用
+            String extra = errMsg.isEmpty() ? "" : (" | 服务端: " + errMsg);
+            if (code == 401) {
+                Logger.log("登录失败(401): 用户名/密码/token 无效或已过期, 已清空登录缓存" + extra);
+                Notify.show("登录失败(401): 用户名/密码/token 无效或已过期" + extra);
+            } else {
+                Logger.log("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足), 已清空登录缓存" + extra);
+                Notify.show("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足)" + extra);
+            }
             return false;
         }
 
         //服务器相同则用户名密码相同，快速复制登陆结果到其它驱动（TBD：可能引入问题）
         if (!drive.getToken().isEmpty()) {
+            serverTokenCache.put(server, drive.getToken()); // A: 登录成功写入缓存, 同 server 后续线程短路复用
             for (Drive d : drives) {
                 if(drive.getServer().equals(d.getServer())) {
                     d.setToken(drive.getToken());
@@ -499,6 +542,35 @@ public class AListSh extends Spider {
             }
         }
         return true;
+    }
+
+    /**
+     * 执行登录接口调用：解析响应，code!=200 时显示服务端返回的原始 message。
+     *
+     * @return 是否登录成功
+     */
+    private boolean doLogin(Drive drive, JSONObject params, String source) {
+        try {
+            String response = OkHttp.post(drive.loginApi(), params.toString());
+            JSONObject json = new JSONObject(response);
+            int code = json.optInt("code", 200);
+            if (code != 200) {
+                String msg = json.optString("message", "");
+                String info = "登录失败(" + source + "): 服务端 code=" + code;
+                if (!msg.isEmpty()) {
+                    info += " - " + msg;
+                }
+                Logger.log(info);
+                Notify.show(info);
+                return false;
+            }
+            drive.setToken(json.getJSONObject("data").getString("token"));
+            return true;
+        } catch (Exception e) {
+            e.printStackTrace();
+            Notify.show("登录失败(" + source + "): 网络异常或凭据无效");
+            return false;
+        }
     }
 
     private boolean loginByConfig(Drive drive) {
@@ -518,11 +590,10 @@ public class AListSh extends Spider {
                 drive.setToken(password);
                 return true;
             } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
-            return true;
+            return doLogin(drive, params, "config");
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(config): 网络异常或凭据无效");
             return false;
         }
     }
@@ -530,25 +601,45 @@ public class AListSh extends Spider {
     private boolean loginByUser(Drive drive) {
         try {
             JSONObject params = new JSONObject();
-            String userName = LoginDlg.showLoginDlg("用户名(留空默认dav)");
-            String password = LoginDlg.showLoginDlg("密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
-            Logger.log("用户名:" + userName + "密码:" + password);
-            userName = userName.isEmpty() ? "dav" : userName;
-            password = password.isEmpty() ? "1234" : password;
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
-            Path.write(loginFile, (userName + "\n" + password).getBytes());
-            params.put("username", userName);
-            params.put("password", password);
-            if (password.startsWith("alist-")) {
-                drive.setToken(password);
-                return true;
-            } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
-            return true;
+            // 登录失败重新弹对话框, 最多尝试 3 次
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                String[] cred = LoginDlg.showLoginDlg(
+                        drive.getServer(),
+                        "用户名(留空默认dav)",
+                        "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
+                if (cred == null) {
+                    Logger.log("登录取消: 用户取消/关闭登录对话框, 中断登录");
+                    return false; // 取消/超时 → 直接中断, 不发请求、不写盘
+                }
+                String userName = cred[0];
+                String password = cred[1];
+                Logger.log("用户名:" + userName + "密码:" + password);
+                userName = userName.isEmpty() ? "dav" : userName;
+                password = password.isEmpty() ? "1234" : password;
+                params.put("username", userName);
+                params.put("password", password);
+                if (password.startsWith("alist-")) {
+                    drive.setToken(password);
+                    Path.write(loginFile, (userName + "\n" + password).getBytes()); // alist- 直通视为成功, 才写盘
+                    return true;
+                }
+                if (doLogin(drive, params, "user")) {
+                    Path.write(loginFile, (userName + "\n" + password).getBytes()); // 成功才写盘
+                    return true;
+                }
+                // 登录失败: 还有剩余次数则重新弹出; 否则结束 (不弹 Toast, 避免顶掉 doLogin 的详细信息)
+                if (attempt < 3) {
+                    Logger.log("登录失败, 第 " + attempt + " 次, 重新弹出登录框");
+                } else {
+                    Logger.log("登录失败, 已达最多 3 次");
+                }
+            }
+            return false;
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(user): 网络异常或凭据无效");
             return false;
         }
     }
@@ -575,12 +666,16 @@ public class AListSh extends Spider {
             if (password.startsWith("alist-")) {
                 drive.setToken(password);
                 return true;
-            } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
+            }
+            if (!doLogin(drive, params, "file")) {
+                // 文件账密登录失败 → 清空 .login, 避免旧错账反复试（下次空则跳过）
+                Path.write(loginFile, "\n\n");
+                return false;
+            }
             return true;
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(file): 网络异常或凭据无效");
             return false;
         }
     }

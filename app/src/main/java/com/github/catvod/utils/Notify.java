@@ -1,6 +1,7 @@
 package com.github.catvod.utils;
 
 import android.text.TextUtils;
+import android.view.Gravity;
 import android.widget.Toast;
 
 import com.github.catvod.spider.Init;
@@ -25,6 +26,7 @@ public class Notify {
         if (TextUtils.isEmpty(message)) return;
         if (mToast != null) mToast.cancel();
         mToast = Toast.makeText(Init.context(), message, Toast.LENGTH_LONG);
+        mToast.setGravity(Gravity.CENTER, 0, 0); // 屏幕正中央
         mToast.show();
     }
 }

@@ -629,15 +629,13 @@ public class AListSh extends Spider {
                     Path.write(loginFile, (userName + "\n" + password).getBytes()); // 成功才写盘
                     return true;
                 }
-                // 登录失败: 还有剩余次数则重新弹出; 否则结束
+                // 登录失败: 还有剩余次数则重新弹出; 否则结束 (不弹 Toast, 避免顶掉 doLogin 的详细信息)
                 if (attempt < 3) {
                     Logger.log("登录失败, 第 " + attempt + " 次, 重新弹出登录框");
-                    Notify.show("登录失败, 请重试 (" + attempt + "/3)");
                 } else {
                     Logger.log("登录失败, 已达最多 3 次");
                 }
             }
-            Notify.show("登录失败, 已达最多次数");
             return false;
         } catch (Exception e) {
             e.printStackTrace();

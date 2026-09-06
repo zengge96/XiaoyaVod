@@ -615,14 +615,18 @@ public class AListSh extends Spider {
             password = password.isEmpty() ? "1234" : password;
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
-            Path.write(loginFile, (userName + "\n" + password).getBytes());
             params.put("username", userName);
             params.put("password", password);
             if (password.startsWith("alist-")) {
                 drive.setToken(password);
+                Path.write(loginFile, (userName + "\n" + password).getBytes()); // alist- 直通视为成功, 才写盘
                 return true;
-            } 
-            return doLogin(drive, params, "user");
+            }
+            if (!doLogin(drive, params, "user")) {
+                return false; // 登录失败不落盘
+            }
+            Path.write(loginFile, (userName + "\n" + password).getBytes()); // 成功才写盘
+            return true;
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(user): 网络异常或凭据无效");
@@ -652,8 +656,13 @@ public class AListSh extends Spider {
             if (password.startsWith("alist-")) {
                 drive.setToken(password);
                 return true;
-            } 
-            return doLogin(drive, params, "file");
+            }
+            if (!doLogin(drive, params, "file")) {
+                // 文件账密登录失败 → 清空 .login, 避免旧错账反复试（下次空则跳过）
+                Path.write(loginFile, "\n\n");
+                return false;
+            }
+            return true;
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(file): 网络异常或凭据无效");

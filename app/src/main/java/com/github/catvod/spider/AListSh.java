@@ -509,7 +509,7 @@ public class AListSh extends Spider {
             JSONObject params = new JSONObject();
             String userName = drive.getLogin().getUsername();
             String password = drive.getLogin().getPassword();
-            Logger.log("用户名:" + userName + "密码:***"); // 脱敏，不落明文密码
+            Logger.log("用户名:" + userName + "密码:" + password);
             userName = userName.isEmpty() ? "dav" : userName;
             password = password.isEmpty() ? "1234" : password;
             params.put("username", userName);
@@ -535,7 +535,7 @@ public class AListSh extends Spider {
                     "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
             String userName = cred[0];
             String password = cred[1];
-            Logger.log("用户名:" + userName + "密码:***"); // 脱敏，不落明文密码
+            Logger.log("用户名:" + userName + "密码:" + password);
             userName = userName.isEmpty() ? "dav" : userName;
             password = password.isEmpty() ? "1234" : password;
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
@@ -569,7 +569,7 @@ public class AListSh extends Spider {
                 userName = parts[0];
                 password = parts[1];
             } 
-            Logger.log("用户名:" + userName + "密码:***"); // 脱敏，不落明文密码
+            Logger.log("用户名:" + userName + "密码:" + password);
             if (userName.isEmpty() || password.isEmpty()) {
                 return false;
             }

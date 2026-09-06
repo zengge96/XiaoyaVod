@@ -72,10 +72,9 @@ public class AListSh extends Spider {
 
     private Context mContext;
 
-    // A+C: 按服务器缓存登录 token, 同服务器 TTL 内短路去重, 避免启动阶段多线程重复登录
+    // A+C: 按服务器缓存登录 token, 同服务器缓存命中即短路去重, 避免启动阶段多线程重复登录
+    // token 有效期极长, 不做 TTL; 仅在服务端实际返回 401/403(失效) 时清缓存重新登录
     private final Map<String, String> serverTokenCache = new HashMap<>();
-    private final Map<String, Long> serverLoginTime = new HashMap<>();
-    private static final long TOKEN_TTL_MS = 60 * 60 * 1000L; // token 缓存有效期 1 小时, 到期重新登录
 
     private String getRootCmd(Drive drive) {
         return drive.getCombinedMode() ? "{ cat index.combined.txt;echo ''; }" : "{ cat index.video.txt;echo ''; }";
@@ -476,7 +475,6 @@ public class AListSh extends Spider {
                     int rc = new JSONObject(retryResp).getInt("code");
                     if (rc == 401 || rc == 403) {
                         serverTokenCache.remove(drive.getServer());
-                        serverLoginTime.remove(drive.getServer());
                     }
                 } catch (Exception ignored) {
                 }
@@ -487,20 +485,17 @@ public class AListSh extends Spider {
     }
 
     private synchronized boolean login(Drive drive) {
-        // A+C: 同一服务器在 TTL 内已登录成功 → 复用 token 直接返回, 不再重复登录/二次验证
+        // A+C: 同一服务器已有缓存 token → 直接复用, 不再重复登录/二次验证; 无 TTL, 失效由服务端 401/403 触发
         String server = drive.getServer();
-        Long loginAt = serverLoginTime.get(server);
-        if (loginAt != null && System.currentTimeMillis() - loginAt < TOKEN_TTL_MS) {
-            String cached = serverTokenCache.get(server);
-            if (cached != null && !cached.isEmpty()) {
-                drive.setToken(cached);
-                for (Drive d : drives) {
-                    if (d.getServer().equals(server)) {
-                        d.setToken(cached);
-                    }
+        String cached = serverTokenCache.get(server);
+        if (cached != null && !cached.isEmpty()) {
+            drive.setToken(cached);
+            for (Drive d : drives) {
+                if (d.getServer().equals(server)) {
+                    d.setToken(cached);
                 }
-                return true;
             }
+            return true;
         }
         boolean result = loginByConfig(drive) || loginByFile(drive) || loginByUser(drive);
         if (!result) {
@@ -526,7 +521,6 @@ public class AListSh extends Spider {
             File loginFile = new File(loginPath);
             Path.write(loginFile, "\n\n");
             serverTokenCache.remove(server); // 真登录后二次验证仍失败 → 清缓存, 避免下次误复用
-            serverLoginTime.remove(server);
             String extra = errMsg.isEmpty() ? "" : (" | 服务端: " + errMsg);
             if (code == 401) {
                 Logger.log("登录失败(401): 用户名/密码/token 无效或已过期, 已清空登录缓存" + extra);
@@ -541,7 +535,6 @@ public class AListSh extends Spider {
         //服务器相同则用户名密码相同，快速复制登陆结果到其它驱动（TBD：可能引入问题）
         if (!drive.getToken().isEmpty()) {
             serverTokenCache.put(server, drive.getToken()); // A: 登录成功写入缓存, 同 server 后续线程短路复用
-            serverLoginTime.put(server, System.currentTimeMillis());
             for (Drive d : drives) {
                 if(drive.getServer().equals(d.getServer())) {
                     d.setToken(drive.getToken());

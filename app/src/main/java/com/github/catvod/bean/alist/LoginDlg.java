@@ -25,7 +25,7 @@ public class LoginDlg {
      */
     public static String showLoginDlg(String hint) {
         String[] result = showLoginDlg(hint, null);
-        return result[0];
+        return result == null ? "" : result[0];
     }
 
     /**
@@ -34,15 +34,16 @@ public class LoginDlg {
      *
      * @param usernameHint 用户名输入框提示
      * @param passwordHint 密码输入框提示（null 表示只需要单输入框）
-     * @return {@code [0]=用户名, [1]=密码}，取消/超时则为空字符串
+     * @return {@code [0]=用户名, [1]=密码}；取消/超时/Activity无效 返回 {@code null}（调用方可据此中断登录）
      */
     public static String[] showLoginDlg(final String usernameHint, final String passwordHint) {
         final CountDownLatch latch = new CountDownLatch(1);
+        final boolean[] confirmed = { false }; // 仅“确定”置 true；取消/返回键/超时保持 false
         final String[] result = { "", "" };
         try {
             Activity activity = Init.getActivity();
             if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-                return result; // Activity 无效，直接返回空，不阻塞
+                return null; // Activity 无效，不阻塞
             }
 
             // 在主线程显示对话框，延迟一步等待 Activity 就绪
@@ -78,6 +79,7 @@ public class LoginDlg {
                                 if (passwordInput != null) {
                                     result[1] = passwordInput.getText().toString();
                                 }
+                                confirmed[0] = true;
                                 latch.countDown();
                             })
                             .setNegativeButton("取消", (dialog, which) -> latch.countDown())
@@ -101,8 +103,9 @@ public class LoginDlg {
             latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             Logger.log("登录对话框异常:" + e);
-            return result;
+            return null;
         }
-        return result;
+        // 仅“确定”返回输入；取消/返回键/超时都返回 null（中断登录）
+        return confirmed[0] ? result : null;
     }
 }

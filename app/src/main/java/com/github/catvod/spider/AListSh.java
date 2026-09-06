@@ -604,6 +604,10 @@ public class AListSh extends Spider {
             String[] cred = LoginDlg.showLoginDlg(
                     "用户名(留空默认dav)",
                     "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
+            if (cred == null) {
+                Logger.log("登录取消: 用户取消/关闭登录对话框, 中断登录");
+                return false; // 取消/超时 → 直接中断, 不发请求、不写盘
+            }
             String userName = cred[0];
             String password = cred[1];
             Logger.log("用户名:" + userName + "密码:" + password);

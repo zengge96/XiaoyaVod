@@ -19,6 +19,7 @@ import com.github.catvod.crawler.Spider;
 import com.github.catvod.net.OkHttp;
 import com.github.catvod.utils.Util;
 import com.github.catvod.utils.Image;
+import com.github.catvod.utils.Notify;
 import com.github.catvod.bean.alist.Pager;
 import org.json.JSONObject;
 import java.util.ArrayList;
@@ -487,6 +488,13 @@ public class AListSh extends Spider {
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
             Path.write(loginFile, "\n\n");
+            if (code == 401) {
+                Logger.log("登录失败(401): 用户名/密码/token 无效或已过期, 已清空登录缓存");
+                Notify.show("登录失败(401): 用户名/密码/token 无效或已过期");
+            } else {
+                Logger.log("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足), 已清空登录缓存");
+                Notify.show("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足)");
+            }
             return false;
         }
 
@@ -523,6 +531,7 @@ public class AListSh extends Spider {
             return true;
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(config): 网络异常或凭据无效");
             return false;
         }
     }
@@ -552,6 +561,7 @@ public class AListSh extends Spider {
             return true;
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(user): 网络异常或凭据无效");
             return false;
         }
     }
@@ -584,6 +594,7 @@ public class AListSh extends Spider {
             return true;
         } catch (Exception e) {
             e.printStackTrace();
+            Notify.show("登录失败(file): 网络异常或凭据无效");
             return false;
         }
     }

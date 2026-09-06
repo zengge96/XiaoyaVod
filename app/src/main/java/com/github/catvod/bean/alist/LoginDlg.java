@@ -5,82 +5,104 @@ import com.github.catvod.spider.Logger;
 
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.DialogInterface;
+import android.text.InputType;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
-import android.widget.Toast;
+import android.widget.LinearLayout;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class LoginDlg {
 
-    private static final Object lock = new Object(); // 用于线程同步的锁
-    private static String userInput = ""; // 用户输入
+    private static final long TIMEOUT_MS = 60_000L; // 对话框最长等待时间，超时自动放弃，避免后台线程永久阻塞
 
     /**
-     * 显示登录对话框，并阻塞后台线程直到对话框关闭
+     * 显示单输入框对话框（兼容旧的单字段场景），阻塞后台线程直到对话框关闭或超时。
      *
      * @param hint 输入框的提示文本
-     * @return 用户输入的内容（如果用户取消输入，返回空字符串）
+     * @return 用户输入的内容（取消/超时返回空字符串）
      */
     public static String showLoginDlg(String hint) {
-        userInput = "";
-        synchronized (lock) {
-            try {
-                Activity activity = Init.getActivity();
-                if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
-                    return ""; // 如果 Activity 无效，直接返回
-                }
+        String[] result = showLoginDlg(hint, null);
+        return result[0];
+    }
 
-                // 在主线程显示对话框
-                Init.run(() -> {
-                    Logger.log("准备显示对话框");
-                    // 创建一个 EditText 用于用户输入
-                    final EditText input = new EditText(activity);
-                    input.setHint(hint);
+    /**
+     * 显示"用户名 + 密码"双输入框登录对话框，一次弹窗收集两个字段，阻塞后台线程直到对话框关闭或超时。
+     * 密码框自动掩码；按返回键/取消/超时都会正常唤醒，不会造成线程卡死。
+     *
+     * @param usernameHint 用户名输入框提示
+     * @param passwordHint 密码输入框提示（null 表示只需要单输入框）
+     * @return {@code [0]=用户名, [1]=密码}，取消/超时则为空字符串
+     */
+    public static String[] showLoginDlg(final String usernameHint, final String passwordHint) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String[] result = { "", "" };
+        try {
+            Activity activity = Init.getActivity();
+            if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+                return result; // Activity 无效，直接返回空，不阻塞
+            }
 
-                    // 创建 AlertDialog
+            // 在主线程显示对话框，延迟一步等待 Activity 就绪
+            Init.run(() -> {
+                try {
+                    final EditText userInput = new EditText(activity);
+                    userInput.setHint(usernameHint);
+                    userInput.setSingleLine(true);
+
+                    final LinearLayout layout = new LinearLayout(activity);
+                    layout.setOrientation(LinearLayout.VERTICAL);
+                    layout.setPadding(60, 30, 60, 0);
+                    layout.addView(userInput);
+
+                    final EditText passwordInput;
+                    if (passwordHint != null) {
+                        passwordInput = new EditText(activity);
+                        passwordInput.setHint(passwordHint);
+                        passwordInput.setSingleLine(true);
+                        passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD); // 密码掩码
+                        layout.addView(passwordInput);
+                    } else {
+                        passwordInput = null;
+                    }
+
                     AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-                    builder.setTitle("输入对话框")
-                            .setMessage("请填写以下信息：")
-                            .setIcon(android.R.drawable.ic_dialog_info) // 设置图标
-                            .setView(input) // 添加输入框
-                            .setPositiveButton("确定", new DialogInterface.OnClickListener() {
-                                @Override
-                                public void onClick(DialogInterface dialog, int which) {
-                                    Logger.log("onClick1:" + userInput);
-                                    synchronized (lock) {
-                                        userInput = input.getText().toString();
-                                        Logger.log("userInput:" + userInput);
-                                        lock.notifyAll(); // 唤醒阻塞的线程
-                                    }
-                                    Logger.log("onClick2:" + userInput);
+                    builder.setTitle("登录设置")
+                            .setMessage(passwordHint != null ? "请填写用户名与密码" : "请填写所需信息")
+                            .setIcon(android.R.drawable.ic_dialog_info)
+                            .setView(layout)
+                            .setPositiveButton("确定", (dialog, which) -> {
+                                result[0] = userInput.getText().toString();
+                                if (passwordInput != null) {
+                                    result[1] = passwordInput.getText().toString();
                                 }
+                                latch.countDown();
                             })
-                            .setNegativeButton("取消", new DialogInterface.OnClickListener() {
-                                @Override
-                                public void onClick(DialogInterface dialog, int which) {
-                                    Logger.log("onClick3:" + userInput);
-                                    synchronized (lock) {
-                                        userInput = ""; // 清空用户输入
-                                        lock.notifyAll(); // 唤醒阻塞的线程
-                                    }
-                                }
-                            });
+                            .setNegativeButton("取消", (dialog, which) -> latch.countDown())
+                            .setOnCancelListener(dialog -> latch.countDown()); // 按返回键也会唤醒，杜绝卡死
 
-                    // 显示对话框
                     AlertDialog dialog = builder.create();
                     dialog.show();
-                    Logger.log("显示对话框完成");
-                }, 500);
+                    // 自动弹出软键盘
+                    userInput.requestFocus();
+                    InputMethodManager imm = (InputMethodManager) activity.getSystemService(Activity.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0);
+                    }
+                } catch (Exception e) {
+                    Logger.log("登录对话框异常:" + e);
+                    latch.countDown();
+                }
+            }, 500);
 
-                // 阻塞后台线程，直到对话框关闭
-                lock.wait(); // 等待对话框关闭
-
-                Logger.log("正确获取输出：" + userInput);
-                return userInput; // 返回用户输入
-            } catch (Exception e) {
-                e.printStackTrace(); // 记录异常日志
-                Logger.log("发生异常");
-                return ""; // 发生异常时返回空字符串
-            }
+            // 阻塞后台线程，直到对话框关闭；带超时兜底
+            latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            Logger.log("登录对话框异常:" + e);
+            return result;
         }
+        return result;
     }
-}
+}

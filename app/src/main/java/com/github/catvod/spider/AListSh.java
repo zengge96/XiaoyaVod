@@ -602,6 +602,7 @@ public class AListSh extends Spider {
         try {
             JSONObject params = new JSONObject();
             String[] cred = LoginDlg.showLoginDlg(
+                    drive.getServer(),
                     "用户名(留空默认dav)",
                     "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
             if (cred == null) {

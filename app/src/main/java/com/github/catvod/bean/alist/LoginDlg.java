@@ -11,11 +11,11 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+
 
 public class LoginDlg {
 
-    private static final long TIMEOUT_MS = 60_000L; // 对话框最长等待时间，超时自动放弃，避免后台线程永久阻塞
+
 
     /**
      * 显示单输入框对话框（兼容旧的单字段场景），阻塞后台线程直到对话框关闭或超时。
@@ -37,6 +37,19 @@ public class LoginDlg {
      * @return {@code [0]=用户名, [1]=密码}；取消/超时/Activity无效 返回 {@code null}（调用方可据此中断登录）
      */
     public static String[] showLoginDlg(final String usernameHint, final String passwordHint) {
+        return showLoginDlg(null, usernameHint, passwordHint);
+    }
+
+    /**
+     * 显示"用户名 + 密码"双输入框登录对话框，一次弹窗收集两个字段，阻塞后台线程直到对话框关闭或超时。
+     * 密码框自动掩码；按返回键/取消/超时都会正常唤醒，不会造成线程卡死。
+     *
+     * @param server       正在登录的服务器地址（显示在标题，多服务器时区分；可为 null）
+     * @param usernameHint 用户名输入框提示
+     * @param passwordHint 密码输入框提示（null 表示只需要单输入框）
+     * @return {@code [0]=用户名, [1]=密码}；取消/超时/Activity无效 返回 {@code null}（调用方可据此中断登录）
+     */
+    public static String[] showLoginDlg(final String server, final String usernameHint, final String passwordHint) {
         final CountDownLatch latch = new CountDownLatch(1);
         final boolean[] confirmed = { false }; // 仅“确定”置 true；取消/返回键/超时保持 false
         final String[] result = { "", "" };
@@ -69,8 +82,9 @@ public class LoginDlg {
                         passwordInput = null;
                     }
 
+                    String title = (server == null || server.isEmpty()) ? "登录设置" : ("登录 - " + server);
                     AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-                    builder.setTitle("登录设置")
+                    builder.setTitle(title)
                             .setMessage(passwordHint != null ? "请填写用户名与密码" : "请填写所需信息")
                             .setIcon(android.R.drawable.ic_dialog_info)
                             .setView(layout)
@@ -99,8 +113,8 @@ public class LoginDlg {
                 }
             }, 500);
 
-            // 阻塞后台线程，直到对话框关闭；带超时兜底
-            latch.await(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            // 阻塞后台线程，直到对话框关闭（不超时，一直等用户操作; 返回键/取消已由 onCancel countDown 唤醒）
+            latch.await();
         } catch (Exception e) {
             Logger.log("登录对话框异常:" + e);
             return null;
@@ -108,4 +122,4 @@ public class LoginDlg {
         // 仅“确定”返回输入；取消/返回键/超时都返回 null（中断登录）
         return confirmed[0] ? result : null;
     }
-}
+}

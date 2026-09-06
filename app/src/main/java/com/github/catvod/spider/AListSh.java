@@ -601,33 +601,44 @@ public class AListSh extends Spider {
     private boolean loginByUser(Drive drive) {
         try {
             JSONObject params = new JSONObject();
-            String[] cred = LoginDlg.showLoginDlg(
-                    drive.getServer(),
-                    "用户名(留空默认dav)",
-                    "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
-            if (cred == null) {
-                Logger.log("登录取消: 用户取消/关闭登录对话框, 中断登录");
-                return false; // 取消/超时 → 直接中断, 不发请求、不写盘
-            }
-            String userName = cred[0];
-            String password = cred[1];
-            Logger.log("用户名:" + userName + "密码:" + password);
-            userName = userName.isEmpty() ? "dav" : userName;
-            password = password.isEmpty() ? "1234" : password;
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
-            params.put("username", userName);
-            params.put("password", password);
-            if (password.startsWith("alist-")) {
-                drive.setToken(password);
-                Path.write(loginFile, (userName + "\n" + password).getBytes()); // alist- 直通视为成功, 才写盘
-                return true;
+            // 登录失败重新弹对话框, 最多尝试 3 次
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                String[] cred = LoginDlg.showLoginDlg(
+                        drive.getServer(),
+                        "用户名(留空默认dav)",
+                        "密码(留空默认1234，\"alist-\"打头会被识别为alist token)");
+                if (cred == null) {
+                    Logger.log("登录取消: 用户取消/关闭登录对话框, 中断登录");
+                    return false; // 取消/超时 → 直接中断, 不发请求、不写盘
+                }
+                String userName = cred[0];
+                String password = cred[1];
+                Logger.log("用户名:" + userName + "密码:" + password);
+                userName = userName.isEmpty() ? "dav" : userName;
+                password = password.isEmpty() ? "1234" : password;
+                params.put("username", userName);
+                params.put("password", password);
+                if (password.startsWith("alist-")) {
+                    drive.setToken(password);
+                    Path.write(loginFile, (userName + "\n" + password).getBytes()); // alist- 直通视为成功, 才写盘
+                    return true;
+                }
+                if (doLogin(drive, params, "user")) {
+                    Path.write(loginFile, (userName + "\n" + password).getBytes()); // 成功才写盘
+                    return true;
+                }
+                // 登录失败: 还有剩余次数则重新弹出; 否则结束
+                if (attempt < 3) {
+                    Logger.log("登录失败, 第 " + attempt + " 次, 重新弹出登录框");
+                    Notify.show("登录失败, 请重试 (" + attempt + "/3)");
+                } else {
+                    Logger.log("登录失败, 已达最多 3 次");
+                }
             }
-            if (!doLogin(drive, params, "user")) {
-                return false; // 登录失败不落盘
-            }
-            Path.write(loginFile, (userName + "\n" + password).getBytes()); // 成功才写盘
-            return true;
+            Notify.show("登录失败, 已达最多次数");
+            return false;
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(user): 网络异常或凭据无效");

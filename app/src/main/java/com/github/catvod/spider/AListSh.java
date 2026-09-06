@@ -476,24 +476,30 @@ public class AListSh extends Spider {
         }
         //即便登陆成功也要再次验证，比如guest登陆成功，但是结果还是401
         int code = 200;
+        String errMsg = "";
         try {
             String path = "/";
             JSONObject params = drive.getParamByPath(path);
             params.put("path", path);
             String response = post(drive, drive.listApi(), params.toString(), false);
-            code = new JSONObject(response).getInt("code");
+            JSONObject json = new JSONObject(response);
+            code = json.getInt("code");
+            if (code != 200) {
+                errMsg = json.optString("message", "");
+            }
         } catch (Exception e) {
         }
         if (code == 401 || code == 403) {
             String loginPath = Path.files() + "/" + drive.getServer().replace("://", "_").replace(":", "_") + ".login";
             File loginFile = new File(loginPath);
             Path.write(loginFile, "\n\n");
+            String extra = errMsg.isEmpty() ? "" : (" | 服务端: " + errMsg);
             if (code == 401) {
-                Logger.log("登录失败(401): 用户名/密码/token 无效或已过期, 已清空登录缓存");
-                Notify.show("登录失败(401): 用户名/密码/token 无效或已过期");
+                Logger.log("登录失败(401): 用户名/密码/token 无效或已过期, 已清空登录缓存" + extra);
+                Notify.show("登录失败(401): 用户名/密码/token 无效或已过期" + extra);
             } else {
-                Logger.log("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足), 已清空登录缓存");
-                Notify.show("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足)");
+                Logger.log("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足), 已清空登录缓存" + extra);
+                Notify.show("登录失败(403): 已登录但无权访问该路径(可能 guest 权限不足)" + extra);
             }
             return false;
         }
@@ -507,6 +513,35 @@ public class AListSh extends Spider {
             }
         }
         return true;
+    }
+
+    /**
+     * 执行登录接口调用：解析响应，code!=200 时显示服务端返回的原始 message。
+     *
+     * @return 是否登录成功
+     */
+    private boolean doLogin(Drive drive, JSONObject params, String source) {
+        try {
+            String response = OkHttp.post(drive.loginApi(), params.toString());
+            JSONObject json = new JSONObject(response);
+            int code = json.optInt("code", 200);
+            if (code != 200) {
+                String msg = json.optString("message", "");
+                String info = "登录失败(" + source + "): 服务端 code=" + code;
+                if (!msg.isEmpty()) {
+                    info += " - " + msg;
+                }
+                Logger.log(info);
+                Notify.show(info);
+                return false;
+            }
+            drive.setToken(json.getJSONObject("data").getString("token"));
+            return true;
+        } catch (Exception e) {
+            e.printStackTrace();
+            Notify.show("登录失败(" + source + "): 网络异常或凭据无效");
+            return false;
+        }
     }
 
     private boolean loginByConfig(Drive drive) {
@@ -526,9 +561,7 @@ public class AListSh extends Spider {
                 drive.setToken(password);
                 return true;
             } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
-            return true;
+            return doLogin(drive, params, "config");
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(config): 网络异常或凭据无效");
@@ -556,9 +589,7 @@ public class AListSh extends Spider {
                 drive.setToken(password);
                 return true;
             } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
-            return true;
+            return doLogin(drive, params, "user");
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(user): 网络异常或凭据无效");
@@ -589,9 +620,7 @@ public class AListSh extends Spider {
                 drive.setToken(password);
                 return true;
             } 
-            String response = OkHttp.post(drive.loginApi(), params.toString());
-            drive.setToken(new JSONObject(response).getJSONObject("data").getString("token"));
-            return true;
+            return doLogin(drive, params, "file");
         } catch (Exception e) {
             e.printStackTrace();
             Notify.show("登录失败(file): 网络异常或凭据无效");

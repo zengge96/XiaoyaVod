@@ -56,6 +56,24 @@ cKey 由 `libckeygenerator.so` 的 `CKeyFacade.GenCKey` 生成。`prebuilt/class
 - 只 hook 这两个 so 的 GOT，不动全局 libc，避免误伤其它线程；
 - 由 `Ysp.init()` 通过 JNI `installCmdHook(pkgName)` 把真实包名传进 native 做动态匹配（不写死），并用 SIGSEGV/SIGABRT 信号处理器把崩溃栈写到 `/sdcard/TV` 或 app 私有目录（诊断用）。
 
+## 4.4 SM4-CBC 加密频道解密（本地代理）
+
+编号 010/011/013/014/015/016（CCTV11/12/14/15/17/4K）的 playurl 返回 m3u8 带：
+
+```
+#EXT-X-KEY:METHOD=SM4-CBC,VIDEOFORMAT="H.264",KEYFORMAT="urn:uuid:3d5e6d35-...",URI="data:text/plain;base64,..."
+```
+
+FongMi 的 iJK 内核只认 NONE/AES-128/SAMPLE-AES 系列，不认国密 SM4-CBC，直接黑屏/绿屏。key 表和 `Sm4Cbc`/`CctvDrmSegmentDecryptor` 实现在央视频破解版的 classes3.dex 里（`com.ysp.tv.player`），已随 jar 打包。
+
+做法（纯插件侧，不改 APK）：
+
+1. `channelPlayurl()` 拿到 playurl 后，先请求一次 m3u8，检测到 `#EXT-X-KEY` 就改返回本地代理地址 `http://127.0.0.1:18089/<key>.m3u8`；
+2. jar 内 `ServerSocket` 起本地 HTTP 服务：收到 m3u8 请求时拉源、去掉 `#EXT-X-KEY` 行、把相对 `.ts` 改成绝对 CDN URL，分片仍走代理；
+3. 收到 `.ts` 请求时拉加密分片，调 `CctvDrmSegmentDecryptor.INSTANCE.decrypt(raw, tsName)` 做 SM4-CBC 解密，返回明文 TS。
+
+**关键判据**：SM4-CBC 解密不改变数据长度，不能用「解密前后长度不同」判断是否生效，要看实际画面（CCTV 11 台标 + 节目内容）。
+
 ## 5. 踩过的坑（都是实测）
 
 1. **`System.loadLibrary` 找不到 so**：FongMi 的 DexClassLoader 只在 `/system/lib` 找，`getLoaded()` 永远 false。改从 jar 资源解压 so 到 cache 目录再 `System.load(绝对路径)`。
@@ -83,6 +101,6 @@ cKey 由 `libckeygenerator.so` 的 `CKeyFacade.GenCKey` 生成。`prebuilt/class
 
 ## 7. 交付形态
 
-- `ysp_spider.jar`：含 v7/arm64 两套 so + classes.dex，md5 `bc55fc2035c97c9a61289029653b4210`
+- `ysp_spider.jar`：含 v7/arm64 两套 so + classes.dex + SM4 解密 dex，md5 `14debcac57d553ff61357b1f009eca99`
 - `config/config_local.json`：本地导入；`config/config_url.json`：网络导入
 - 全部源码、so、smali、构建脚本都在本目录，可完整重建

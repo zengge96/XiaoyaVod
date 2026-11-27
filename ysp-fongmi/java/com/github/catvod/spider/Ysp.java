@@ -16,6 +16,9 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.io.FileOutputStream;
+import java.io.ByteArrayOutputStream;
 import com.ysp.tv.player.CctvDrmSegmentDecryptor;
 import java.io.File;
 import java.util.ArrayList;
@@ -28,8 +31,63 @@ import java.util.concurrent.Future;
 public class Ysp extends Spider {
     private Context ctx;
     private static final int PROXY_PORT = 18089;
-    private static final Map<String, String> PROXY_MAP = new HashMap<String, String>();
+    private static final Map<String, String> PROXY_MAP = new ConcurrentHashMap<String, String>();
     private static volatile boolean proxyStarted = false;
+    private static final String CACHE_FILE = "/sdcard/Android/data/com.fongmi.android.tv/files/ysp_live_cache.txt";
+    private static final long CACHE_TTL = 30000;
+    private static final String[] ENC_CNLID = {"2027248701","2027248801","2027248901","2027249001","2027249401","2029810301"};
+
+    private static boolean isEncrypted(String cnlid) {
+        for (int i = 0; i < ENC_CNLID.length; i++) if (ENC_CNLID[i].equals(cnlid)) return true;
+        return false;
+    }
+
+    private static String readFile(File f) {
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            ByteArrayOutputStream b = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192]; int n;
+            while ((n = in.read(buf)) > 0) b.write(buf, 0, n);
+            in.close();
+            return new String(b.toByteArray(), "UTF-8");
+        } catch (Throwable t) { return null; }
+    }
+
+    private static String readCache() {
+        try {
+            File f = new File(CACHE_FILE);
+            if (!f.exists()) return null;
+            String all = readFile(f);
+            if (all == null) return null;
+            String mark = "\n---M3U---\n";
+            int sep = all.indexOf(mark);
+            if (sep < 0) return null;
+            String head = all.substring(0, sep);
+            String m3u = all.substring(sep + mark.length());
+            String[] hl = head.split("\n");
+            long ts = Long.parseLong(hl[0].trim());
+            if (System.currentTimeMillis() - ts > CACHE_TTL) return null;
+            for (int i = 1; i < hl.length; i++) {
+                int p = hl[i].indexOf('|');
+                if (p > 0) PROXY_MAP.put(hl[i].substring(0, p), hl[i].substring(p + 1));
+            }
+            ensureProxy();
+            jlog("LIVE cache hit age=" + (System.currentTimeMillis() - ts) + "ms");
+            return m3u;
+        } catch (Throwable t) { return null; }
+    }
+
+    private static void writeCache(String m3u) {
+        try {
+            StringBuilder sb = new StringBuilder(String.valueOf(System.currentTimeMillis()) + "\n");
+            for (Map.Entry<String, String> e : PROXY_MAP.entrySet())
+                sb.append(e.getKey()).append('|').append(e.getValue()).append('\n');
+            sb.append("---M3U---\n").append(m3u);
+            FileOutputStream o = new FileOutputStream(CACHE_FILE);
+            o.write(sb.toString().getBytes("UTF-8"));
+            o.close();
+        } catch (Throwable t) {}
+    }
 
     public static native void installCmdHook(String pkg);
 
@@ -256,7 +314,7 @@ public class Ysp extends Spider {
         jlog("CK_INIT_DONE");
     }
 
-    private String channelPlayurl(String[] ch, long tick, String guid, String est) {
+    private static String channelPlayurl(String[] ch, long tick, String guid, String est) {
         try {
             String cnlid=ch[2], pid=ch[3], prog=ch[4];
             String ck = CKey.INSTANCE.generate(tick, cnlid);
@@ -280,41 +338,62 @@ public class Ysp extends Spider {
                 return null;
             }
             jlog("OK_PU " + ch[1] + " " + pu.length());
-            try {
-                String m3u8 = NetBridge.get(pu);
-                int bar = m3u8.indexOf('|');
-                String body2 = bar >= 0 ? m3u8.substring(bar + 1) : m3u8;
-                boolean hasKey = body2.indexOf("#EXT-X-KEY") >= 0;
-                if (ch[1].startsWith("CCTV1") || ch[1].equals("CCTV4K")) jlog("CHK " + ch[1] + " len=" + body2.length() + " key=" + hasKey + " head=" + body2.substring(0, Math.min(40, body2.length())).replace("\n"," "));
-                if (hasKey) {
-                    String p = proxyUrl(pu);
-                    jlog("PROXIED " + ch[1] + " " + p);
-                    return p;
-                }
-            } catch (Throwable t) { jlog("CHKERR " + ch[1] + " " + t); }
+            if (isEncrypted(cnlid)) {
+                String p = proxyUrl(pu);
+                jlog("PROXIED " + ch[1] + " " + p);
+                return p;
+            }
             return pu;
         } catch (Throwable t) { return null; }
+    }
+
+    private static class ChannelTask implements Callable<String> {
+        private final int idx;
+        private final long tick;
+        private final String guid;
+        private final String est;
+        ChannelTask(int idx, long tick, String guid, String est) {
+            this.idx = idx; this.tick = tick; this.guid = guid; this.est = est;
+        }
+        @Override
+        public String call() { return channelPlayurl(CHANNELS[idx], tick, guid, est); }
     }
 
     @Override
     public String liveContent(String url) throws Exception {
         try {
+            String cached = readCache();
+            if (cached != null) return cached;
+        } catch (Throwable ignore) {}
+        try {
             final long tick = System.currentTimeMillis() / 1000;
             final String guid = CKey.INSTANCE.getGUID();
             final String est = CKey.INSTANCE.estId();
-            StringBuilder sb = new StringBuilder("#EXTM3U\n");
-            int ok = 0;
+            final String[] results = new String[CHANNELS.length];
+            ExecutorService pool = Executors.newFixedThreadPool(12);
+            List<Future> futures = new ArrayList<Future>();
             jlog("LIVE start channels=" + CHANNELS.length + " tick=" + tick);
             for (int i = 0; i < CHANNELS.length; i++) {
-                String[] ch = CHANNELS[i];
-                String pu = channelPlayurl(ch, tick, guid, est);
+                final int idx = i;
+                futures.add(pool.submit(new ChannelTask(idx, tick, guid, est)));
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                try { results[i] = (String) futures.get(i).get(); } catch (Throwable t) { results[i] = null; }
+            }
+            pool.shutdown();
+            StringBuilder sb = new StringBuilder("#EXTM3U\n");
+            int ok = 0;
+            for (int i = 0; i < CHANNELS.length; i++) {
+                String pu = results[i];
                 if (pu != null) {
-                    sb.append("#EXTINF:-1,").append(ch[0]).append("$").append(ch[1]).append("\n").append(pu).append("\n");
+                    sb.append("#EXTINF:-1,").append(CHANNELS[i][0]).append("$").append(CHANNELS[i][1]).append("\n").append(pu).append("\n");
                     ok++;
                 }
             }
             jlog("LIVE channels ok=" + ok + "/" + CHANNELS.length);
-            return sb.toString();
+            String m3u = sb.toString();
+            writeCache(m3u);
+            return m3u;
         } catch (Throwable t) {
             java.io.StringWriter sw = new java.io.StringWriter();
             t.printStackTrace(new java.io.PrintWriter(sw));

@@ -55,7 +55,15 @@ export NDK_PATH=/path/to/android-ndk
 ./build.sh                    # 重建 ysp_spider.jar
 ```
 
-产物 md5 应与已验证包一致：`14debcac57d553ff61357b1f009eca99`（51 频道 SM4 解密版，央视/卫视分组）。
+产物 md5 应与已验证包一致：`5cbe8a18f5cd5370970c31c11b55f108`（51 频道 SM4 解密 + 启动优化版，央视/卫视分组）。
+
+## 启动速度优化
+
+老版本每次冷启动点直播要串行给 51 个频道生成 cKey/playurl、且每频道额外请求一次 m3u8 探测 KEY，实测约 16.5 秒。优化后：
+
+- 加密频道改用 cnlid 白名单判断（`ENC_CNLID`），去掉 51 次 m3u8 探测请求
+- 12 线程池并发生成各频道 playurl，实测 LIVE 生成降到约 1.5 秒
+- 30 秒 m3u 缓存（`/sdcard/Android/data/com.fongmi.android.tv/files/ysp_live_cache.txt`），期间重启直接命中，秒开
 
 ## SM4 加密频道解密
 
@@ -71,7 +79,7 @@ export NDK_PATH=/path/to/android-ndk
 ## 验证记录
 
 - 32 位 FongMi 5.1.0 电视版（单频道基线）：GenCKey 682、四帧画面推进、100 秒无 403/重试/崩溃
-- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64，51 频道 SM4 解密版 md5 `14debcac...`）：`LIVE channels ok=48/51`，OSD 面板显示 `001 央视$CCTV1`…，CCTV1 多帧持续推进；CCTV11（SM4 加密频道）经本地代理解密后出正常 CCTV 11 台标画面，进程存活无崩溃
+- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64，51 频道 SM4 解密版 md5 `5cbe8a18...`）：`LIVE channels ok=48/51`，OSD 面板显示 `001 央视$CCTV1`…，CCTV1 多帧持续推进；CCTV11（SM4 加密频道）经本地代理解密后出正常 CCTV 11 台标画面，进程存活无崩溃
 - 少数频道（如部分卫视）因地区版权返回 iret≠0，jar 自动跳过，不影响其余频道
 
 详细技术原理见 `docs/TECHNICAL.md`。

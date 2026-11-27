@@ -101,6 +101,6 @@ FongMi 的 iJK 内核只认 NONE/AES-128/SAMPLE-AES 系列，不认国密 SM4-CB
 
 ## 7. 交付形态
 
-- `ysp_spider.jar`：含 v7/arm64 两套 so + classes.dex + SM4 解密 dex + 启动优化，md5 `5cbe8a18f5cd5370970c31c11b55f108`
+- `ysp_spider.jar`：含 v7/arm64 两套 so + classes.dex + SM4 解密 dex + 启动优化，md5 `2dce502b860c8539d93e1319492da0bc`
 - `config/config_local.json`：本地导入；`config/config_url.json`：网络导入
 - 全部源码、so、smali、构建脚本都在本目录，可完整重建

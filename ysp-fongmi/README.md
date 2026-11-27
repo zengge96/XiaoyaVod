@@ -55,7 +55,11 @@ export NDK_PATH=/path/to/android-ndk
 ./build.sh                    # 重建 ysp_spider.jar
 ```
 
-产物 md5 应与已验证包一致：`5cbe8a18f5cd5370970c31c11b55f108`（51 频道 SM4 解密 + 启动优化版，央视/卫视分组）。
+产物 md5 应与已验证包一致：`2dce502b860c8539d93e1319492da0bc`（51 频道 SM4 解密 + 启动优化版，央视/卫视分组）。
+
+## 频道分组与启动速度优化
+
+FongMi 的直播分组靠 `#EXTINF` 里的 `group-title="央视"` 属性解析（不是 `央视$CCTV1` 这种 `$` 写法，那会把整串当频道名显示）。频道名只写频道号，分组栏显示「央视」「卫视」两部分。缓存文件升级为 v2 路径以免旧格式缓存污染。
 
 ## 启动速度优化
 
@@ -79,7 +83,7 @@ export NDK_PATH=/path/to/android-ndk
 ## 验证记录
 
 - 32 位 FongMi 5.1.0 电视版（单频道基线）：GenCKey 682、四帧画面推进、100 秒无 403/重试/崩溃
-- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64，51 频道 SM4 解密版 md5 `5cbe8a18...`）：`LIVE channels ok=48/51`，OSD 面板显示 `001 央视$CCTV1`…，CCTV1 多帧持续推进；CCTV11（SM4 加密频道）经本地代理解密后出正常 CCTV 11 台标画面，进程存活无崩溃
+- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64，51 频道 SM4 解密版 md5 `2dce502b...`）：`LIVE channels ok=48/51`，OSD 面板分组栏显示「央视」「卫视」，频道名只写 `CCTV1`…，CCTV1 多帧持续推进；CCTV11（SM4 加密频道）经本地代理解密后出正常 CCTV 11 台标画面，进程存活无崩溃
 - 少数频道（如部分卫视）因地区版权返回 iret≠0，jar 自动跳过，不影响其余频道
 
 详细技术原理见 `docs/TECHNICAL.md`。

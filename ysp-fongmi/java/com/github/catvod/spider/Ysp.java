@@ -33,7 +33,7 @@ public class Ysp extends Spider {
     private static final int PROXY_PORT = 18089;
     private static final Map<String, String> PROXY_MAP = new ConcurrentHashMap<String, String>();
     private static volatile boolean proxyStarted = false;
-    private static final String CACHE_FILE = "/sdcard/Android/data/com.fongmi.android.tv/files/ysp_live_cache.txt";
+    private static final String CACHE_FILE = "/sdcard/Android/data/com.fongmi.android.tv/files/ysp_live_cache_v2.txt";
     private static final long CACHE_TTL = 30000;
     private static final String[] ENC_CNLID = {"2027248701","2027248801","2027248901","2027249001","2027249401","2029810301"};
 
@@ -386,7 +386,7 @@ public class Ysp extends Spider {
             for (int i = 0; i < CHANNELS.length; i++) {
                 String pu = results[i];
                 if (pu != null) {
-                    sb.append("#EXTINF:-1,").append(CHANNELS[i][0]).append("$").append(CHANNELS[i][1]).append("\n").append(pu).append("\n");
+                    sb.append("#EXTINF:-1 group-title=\"").append(CHANNELS[i][0]).append("\",").append(CHANNELS[i][1]).append("\n").append(pu).append("\n");
                     ok++;
                 }
             }

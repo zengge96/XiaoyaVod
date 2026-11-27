@@ -23,7 +23,7 @@ rm -rf build/finaldex && mkdir -p build/finaldex
   prebuilt/classes3.dex \
   build/yclass/com/github/catvod/crawler/Spider.class \
   build/yclass/com/ysp/svc/NetBridge.class \
-  build/yclass/com/github/catvod/spider/Ysp.class
+  build/yclass/com/github/catvod/spider/Ysp*.class
 
 echo "=== 3. 打包 jar（含 v7/arm64 两套 so） ==="
 rm -rf build/jarout && mkdir -p build/jarout/lib/armeabi-v7a build/jarout/lib/arm64-v8a

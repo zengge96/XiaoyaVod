@@ -6,6 +6,17 @@ import com.ysp.svc.NetBridge;
 import com.ysp.tv.ckey.CKey;
 import org.json.JSONObject;
 import java.net.URLEncoder;
+import java.net.URLDecoder;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.InetAddress;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.Map;
+import java.util.HashMap;
+import com.ysp.tv.player.CctvDrmSegmentDecryptor;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
@@ -16,8 +27,119 @@ import java.util.concurrent.Future;
 
 public class Ysp extends Spider {
     private Context ctx;
+    private static final int PROXY_PORT = 18089;
+    private static final Map<String, String> PROXY_MAP = new HashMap<String, String>();
+    private static volatile boolean proxyStarted = false;
 
     public static native void installCmdHook(String pkg);
+
+    private static synchronized void ensureProxy() {
+        if (proxyStarted) return;
+        proxyStarted = true;
+        new Thread(new ProxyAccept(), "ysp-proxy").start();
+        jlog("PROXY_START " + PROXY_PORT);
+    }
+
+    private static class ProxyAccept implements Runnable {
+        public void run() {
+            try {
+                ServerSocket srv = new ServerSocket(PROXY_PORT);
+                while (true) {
+                    try {
+                        Socket c = srv.accept();
+                        Thread t = new Thread(new ClientHandler(c), "ysp-proxy-h");
+                        t.setDaemon(true);
+                        t.start();
+                    } catch (Throwable ignore) {}
+                }
+            } catch (Throwable t) { jlog("PROXY_FAIL " + t); }
+        }
+    }
+
+    private static class ClientHandler implements Runnable {
+        private final Socket c;
+        ClientHandler(Socket sock) { this.c = sock; }
+        public void run() { handleProxy(c); }
+    }
+
+    private static void handleProxy(Socket c) {
+        try {
+            BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+            String req = br.readLine();
+            if (req == null) { c.close(); return; }
+            String path = req.split(" ")[1];
+            if (path.startsWith("/")) path = path.substring(1);
+            int q = path.indexOf('?');
+            if (q >= 0) path = path.substring(0, q);
+            byte[] body;
+            String ctype = "application/vnd.apple.mpegurl";
+            if (path.startsWith("ts/")) {
+                try {
+                    String rest = path.substring(3);
+                    int slash = rest.indexOf('/');
+                    String realTs = (slash >= 0 ? rest.substring(slash + 1) : rest);
+                    if (realTs.startsWith("http")) {
+                        java.net.HttpURLConnection tc = (java.net.HttpURLConnection) new java.net.URL(realTs).openConnection();
+                        tc.setRequestProperty("User-Agent", "Mozilla/5.0");
+                        tc.setConnectTimeout(8000); tc.setReadTimeout(8000);
+                        java.io.InputStream tis = tc.getInputStream();
+                        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                        byte[] buf = new byte[8192]; int r;
+                        while ((r = tis.read(buf)) > 0) bos.write(buf, 0, r);
+                        tis.close();
+                        byte[] raw = bos.toByteArray();
+                        String tsName = realTs.substring(realTs.lastIndexOf('/') + 1);
+                        boolean sup = CctvDrmSegmentDecryptor.INSTANCE.supportsSegmentName(tsName);
+                        jlog("TSSUP " + tsName + " supports=" + sup);
+                        byte[] dec = CctvDrmSegmentDecryptor.INSTANCE.decrypt(raw, tsName);
+                        body = dec != null ? dec : raw;
+                        jlog("TSPROXY " + tsName + " raw=" + raw.length + " dec=" + body.length + " changed=" + (dec != null && dec.length != raw.length));
+                    } else { body = new byte[0]; }
+                } catch (Throwable t) { jlog("TSPROXY ERR=" + t); body = new byte[0]; }
+                OutputStream os = c.getOutputStream();
+                os.write(("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: " + body.length + "\r\nConnection: close\r\nAccept-Ranges: bytes\r\n\r\n").getBytes("UTF-8"));
+                os.write(body); os.flush(); c.close(); return;
+            }
+            String src = PROXY_MAP.get(path);
+            if (src != null) {
+                String m3u8 = NetBridge.get(src);
+                int bar = m3u8.indexOf('|');
+                if (bar >= 0) m3u8 = m3u8.substring(bar + 1);
+                String dir = src.substring(0, src.lastIndexOf('/') + 1);
+                StringBuilder out = new StringBuilder();
+                String[] lines = m3u8.split("\n");
+                for (int i = 0; i < lines.length; i++) {
+                    String ln = lines[i].trim();
+                    if (ln.startsWith("#EXT-X-KEY")) continue;
+                    if (!ln.startsWith("#") && ln.length() > 0 && !ln.startsWith("http")) {
+                        ln = dir + ln;
+                    }
+                    if (!ln.startsWith("#") && ln.length() > 0 && ln.startsWith("http")) {
+                        ln = "http://127.0.0.1:" + PROXY_PORT + "/ts/0/" + ln;
+                    }
+                    out.append(ln).append("\n");
+                }
+                body = out.toString().getBytes("UTF-8");
+            } else {
+                body = "#EXTM3U\n".getBytes("UTF-8");
+            }
+            OutputStream os = c.getOutputStream();
+            os.write(("HTTP/1.1 200 OK\r\nContent-Type: " + ctype + "\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n").getBytes("UTF-8"));
+            os.write(body);
+            os.flush();
+            c.close();
+        } catch (Throwable t) {
+            try { c.close(); } catch (Throwable ignore) {}
+        }
+    }
+
+    private static String proxyUrl(String srcM3u8) {
+        ensureProxy();
+        String key = "c" + Math.abs(srcM3u8.hashCode()) + ".m3u8";
+        PROXY_MAP.put(key, srcM3u8);
+        return "http://127.0.0.1:" + PROXY_PORT + "/" + key;
+    }
+
 
     private static void jlog(String s) {
         String[] paths = {
@@ -158,6 +280,18 @@ public class Ysp extends Spider {
                 return null;
             }
             jlog("OK_PU " + ch[1] + " " + pu.length());
+            try {
+                String m3u8 = NetBridge.get(pu);
+                int bar = m3u8.indexOf('|');
+                String body2 = bar >= 0 ? m3u8.substring(bar + 1) : m3u8;
+                boolean hasKey = body2.indexOf("#EXT-X-KEY") >= 0;
+                if (ch[1].startsWith("CCTV1") || ch[1].equals("CCTV4K")) jlog("CHK " + ch[1] + " len=" + body2.length() + " key=" + hasKey + " head=" + body2.substring(0, Math.min(40, body2.length())).replace("\n"," "));
+                if (hasKey) {
+                    String p = proxyUrl(pu);
+                    jlog("PROXIED " + ch[1] + " " + p);
+                    return p;
+                }
+            } catch (Throwable t) { jlog("CHKERR " + ch[1] + " " + t); }
             return pu;
         } catch (Throwable t) { return null; }
     }

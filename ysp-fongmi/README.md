@@ -1,6 +1,6 @@
 # FongMi / OK影视 央视频直播插件（ysp_spider）
 
-让 FongMi / OK影视（TVBox 类播放器）通过 JSON 配置加载 `ysp_spider.jar`，直接播放 CCTV1 直播，无需改播放器 APK。
+让 FongMi / OK影视（TVBox 类播放器）通过 JSON 配置加载 `ysp_spider.jar`，播放央视/卫视共 51 个直播频道，无需改播放器 APK。频道在直播页按「央视」「卫视」两个栏目分组显示。
 
 **jar 本身是双 ABI（arm64-v8a + armeabi-v7a）**，按进程架构自动选 so，32 位和 64 位播放器都能用。分支名里的 `64bit` 只是标记这次最后攻克的场景（64 位手机版 5.0.2 上的 libest.so 闪退），不代表只支持 64 位。
 
@@ -55,11 +55,14 @@ export NDK_PATH=/path/to/android-ndk
 ./build.sh                    # 重建 ysp_spider.jar
 ```
 
-产物 md5 应与已验证包一致：`bc55fc2035c97c9a61289029653b4210`
+产物 md5 应与已验证包一致：`d5452d5e903cb95b2cb9b4a9e684a873`（51 频道版，央视/卫视分组）。
+
+注意：`CHANNELS` 表里每项格式是 `{栏目,频道名,cnlid,livepid,program_id}`，`channelPlayurl()` 必须用 `ch[2]/ch[3]/ch[4]` 取 cnlid/pid/program_id；早期用 `ch[1]/ch[2]/ch[3]` 会因整体错位一位导致 `iretcode=14 请求uri格式出错`。
 
 ## 验证记录
 
-- 32 位 FongMi 5.1.0 电视版：GenCKey 682、四帧画面推进、100 秒无 403/重试/崩溃
-- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64）：GenCKey 682、m3u8 200、100 秒稳定、四帧 CCTV1《三餐四季 江西篇》推进
+- 32 位 FongMi 5.1.0 电视版（单频道基线）：GenCKey 682、四帧画面推进、100 秒无 403/重试/崩溃
+- 64 位 OK影视手机版 5.0.2（`com.fongmi.android.tv`，arm64，51 频道版 md5 `d5452d5e...`）：`LIVE channels ok=48/51`，OSD 面板显示 `001 央视$CCTV1`…`009 央视$CCTV10`，CCTV1 多帧《今日说法》持续推进，进程存活无崩溃
+- 少数频道（如部分卫视）因地区版权返回 iret≠0，jar 自动跳过，不影响其余频道
 
 详细技术原理见 `docs/TECHNICAL.md`。

@@ -7,6 +7,12 @@ import com.ysp.tv.ckey.CKey;
 import org.json.JSONObject;
 import java.net.URLEncoder;
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class Ysp extends Spider {
     private Context ctx;
@@ -14,35 +20,86 @@ public class Ysp extends Spider {
     public static native void installCmdHook(String pkg);
 
     private static void jlog(String s) {
-        try {
-            java.io.File d = new java.io.File("/sdcard/TV");
-            if (!d.exists()) d.mkdirs();
-            java.io.File f2 = new java.io.File(d, "probe.txt");
-            java.io.FileOutputStream p = new java.io.FileOutputStream(f2);
-            p.write(49); p.close();
-            java.io.FileOutputStream f = new java.io.FileOutputStream(new java.io.File(d, "ysp_java.log"), true);
-            f.write((System.currentTimeMillis() + " " + s + "\n").getBytes("UTF-8"));
-            f.close();
-        } catch (Throwable t) {
+        String[] paths = {
+            "/sdcard/TV/ysp_java.log",
+            "/sdcard/Android/data/com.fongmi.android.tv/files/ysp_java.log",
+            "/data/local/tmp/ysp_java.log"
+        };
+        for (int i = 0; i < paths.length; i++) {
             try {
-                java.io.FileOutputStream f = new java.io.FileOutputStream("/data/local/tmp/ysp_java_err.log", true);
-                f.write((String.valueOf(t) + "\n").getBytes("UTF-8"));
-                f.close();
+                java.io.File f = new java.io.File(paths[i]);
+                java.io.File par = f.getParentFile();
+                if (par != null && !par.exists()) par.mkdirs();
+                java.io.FileOutputStream o = new java.io.FileOutputStream(f, true);
+                o.write((System.currentTimeMillis() + " " + s + "\n").getBytes("UTF-8"));
+                o.close();
+                return;
             } catch (Throwable ignore) {}
         }
     }
 
-    private static void installCrashHandler() {
-        jlog("CRASH_HANDLER_SKIP");
-    }
+    private static void installCrashHandler() { jlog("CRASH_HANDLER_SKIP"); }
 
     private static final String LIVEINFO =
         "https://liveinfo.ysp.cctv.cn/?spacode=7&app_version=305060&spwm=2&hevclv=26&platform=4330303&sdtfrom=v5028"
-        + "&stream=3&sphttps=0&cnlid=2024078201&spdynamicrange=1&refer_pageId=none&spdemuxer=14"
+        + "&stream=3&sphttps=0&spdynamicrange=1&refer_pageId=none&spdemuxer=14"
         + "&spvcode=MSgzMDoyMTYwLDYwOjE0NDAsOTA6MTA4MCwxMjA6MTA4MHwzMDoyMTYwLDYwOjE0NDAsOTA6MTA4MCwxMjA6MTA4MCk7MigzMDoyMTYwLDYwOjE0NDAsOTA6MTA4MHwzMDoxMDgwLDYwOjEwODAsOTA6MTA4MCwxMjA6MTA4MCk="
-        + "&sphdrfps=60&defnsrc=3&livepid=600001859&program_id=22628854"
-        + "&appVer=V8.26.1034.0171&defn=fhd&encryptVer=4.2&spdrm=2&pageId=page_channel_510104"
+        + "&sphdrfps=60&defnsrc=3&appVer=V8.26.1034.0171&defn=fhd&encryptVer=4.2&spdrm=2&pageId=page_channel_510104"
         + "&newnettype=1&spflvaudio=1&adjust=1&logintype=1&vip_status=0&spflv=1&uhd_flag=0&cmd=2&otype=json&caplv=1";
+
+    private static final String[][] CHANNELS = {
+        {"央视","CCTV1","2024078201","600001859","22628854"},
+        {"央视","CCTV2","2024075401","600001800","22628483"},
+        {"央视","CCTV3","2024068501","600001801","22627085"},
+        {"央视","CCTV4","2029797101","600001814","22626969"},
+        {"央视","CCTV5","2024078401","600001818","22624627"},
+        {"央视","CCTV5+","2024078001","600001817","22624542"},
+        {"央视","CCTV6","2030868901","600001802","22608885"},
+        {"央视","CCTV7","2024072001","600004092","22626178"},
+        {"央视","CCTV8","2029793001","600001803","22627678"},
+        {"央视","CCTV9","2024078601","600004078","22615311"},
+        {"央视","CCTV10","2024078701","600001805","22627549"},
+        {"央视","CCTV11","2027248701","600001806","22626786"},
+        {"央视","CCTV12","2027248801","600001807","22626137"},
+        {"央视","CCTV13","2029797201","600001811","22635752"},
+        {"央视","CCTV14","2027248901","600001809","22615467"},
+        {"央视","CCTV15","2027249001","600001815","22641066"},
+        {"央视","CCTV16","2027249101","600098637","22624441"},
+        {"央视","CCTV17","2027249401","600001810","22627407"},
+        {"央视","CCTV4K","2029810301","600002264","22621308"},
+        {"央视","CCTV8K","2026774101","600156816","22620621"},
+        {"央视","CGTN","2024181701","600014550","22614334"},
+        {"央视","CGTN法语频道","2024181801","600084704","22614085"},
+        {"央视","CGTN俄语频道","2024181901","600084758","22614132"},
+        {"央视","CGTN阿拉伯语频道","2024182001","600084782","22614145"},
+        {"央视","CGTN西班牙语频道","2024182101","600084744","22614147"},
+        {"央视","CGTN外语纪录频道","2024182301","600084781","22614346"},
+        {"卫视","北京卫视","2024052703","600002309",""},
+        {"卫视","东方卫视","2024054503","600002483",""},
+        {"卫视","江苏卫视","2024171103","600002521",""},
+        {"卫视","浙江卫视","2024054703","600002520",""},
+        {"卫视","湖南卫视","2024054803","600002475",""},
+        {"卫视","湖北卫视","2024171203","600002508",""},
+        {"卫视","广东卫视","2024060903","600002485",""},
+        {"卫视","广西卫视","2024060703","600002509",""},
+        {"卫视","黑龙江卫视","2029797003","600002498",""},
+        {"卫视","海南卫视","2024055603","600002506",""},
+        {"卫视","重庆卫视","2024061103","600002531",""},
+        {"卫视","深圳卫视","2024061303","600002481",""},
+        {"卫视","四川卫视","2024061403","600002516",""},
+        {"卫视","河南卫视","2029797303","600002525",""},
+        {"卫视","福建东南卫视","2024061503","600002484",""},
+        {"卫视","贵州卫视","2024061603","600002490",""},
+        {"卫视","江西卫视","2024061703","600002503",""},
+        {"卫视","辽宁卫视","2024171303","600002505",""},
+        {"卫视","安徽卫视","2024171403","600002532",""},
+        {"卫视","河北卫视","2024171503","600002493",""},
+        {"卫视","山东卫视","2029787903","600002513",""},
+        {"卫视","天津卫视","2019927003","600152137",""},
+        {"卫视","新疆卫视","2050898603","600152138",""},
+        {"卫视","兵团卫视","2025990501","600193252",""},
+        {"卫视","国学频道","2029360403","600213139",""}
+    };
 
     private void loadSo(Context context, String name) throws Exception {
         File dir = new File(context.getCacheDir(), "jar");
@@ -58,8 +115,7 @@ public class Ysp extends Spider {
             byte[] buf = new byte[8192];
             int n;
             while ((n = is.read(buf)) > 0) os.write(buf, 0, n);
-            os.close();
-            is.close();
+            os.close(); is.close();
         }
         System.load(out.getAbsolutePath());
     }
@@ -69,43 +125,62 @@ public class Ysp extends Spider {
         ctx = context;
         jlog("INIT pkg=" + context.getPackageName() + " arch=" + System.getProperty("os.arch"));
         installCrashHandler();
-        try { loadSo(context, "cmdhook"); jlog("HOOK_SO_LOADED"); } catch (Throwable t) { jlog("HOOK_SO_FAIL " + t); }
-        jlog("BEFORE_CK_SO");
-        try { loadSo(context, "stdc++"); jlog("STDC_SO_LOADED"); } catch (Throwable t) { jlog("STDC_SO_SKIP " + t); }
-        try { loadSo(context, "ckeygenerator"); jlog("CK_SO_LOADED"); } catch (Throwable t) { jlog("CK_SO_FAIL " + t); }
-        jlog("BEFORE_GUARD_SO");
-        try { loadSo(context, "ckguard"); jlog("GUARD_SO_LOADED"); } catch (Throwable t) { jlog("GUARD_SO_FAIL " + t); }
-        jlog("SKIP_EST_SO");
-        jlog("BEFORE_INSTALL_HOOK");
-        try { installCmdHook(context.getPackageName()); jlog("HOOK_INSTALLED"); } catch (Throwable t) { jlog("HOOK_FAIL " + t); }
-        jlog("BEFORE_CK_INIT");
+        try { loadSo(context, "cmdhook"); } catch (Throwable t) { jlog("HOOK_SO_FAIL " + t); }
+        try { loadSo(context, "stdc++"); } catch (Throwable ignore) {}
+        try { loadSo(context, "ckeygenerator"); } catch (Throwable t) { jlog("CK_SO_FAIL " + t); }
+        try { loadSo(context, "ckguard"); } catch (Throwable t) { jlog("GUARD_SO_FAIL " + t); }
+        try { installCmdHook(context.getPackageName()); } catch (Throwable t) { jlog("HOOK_FAIL " + t); }
         CKey.INSTANCE.init(context);
         jlog("CK_INIT_DONE");
+    }
+
+    private String channelPlayurl(String[] ch, long tick, String guid, String est) {
+        try {
+            String cnlid=ch[2], pid=ch[3], prog=ch[4];
+            String ck = CKey.INSTANCE.generate(tick, cnlid);
+            String url = LIVEINFO
+                + "&cnlid=" + cnlid + "&livepid=" + pid
+                + (prog.isEmpty() ? "" : "&program_id=" + prog)
+                + "&cKey=" + ck + "&fntick=" + tick
+                + "&guid=" + guid + "&estid=" + URLEncoder.encode(est, "UTF-8")
+                + "&flowid=" + cnlid + "_" + tick + "_4330303"
+                + "&randnum=" + Math.random();
+            String resp = NetBridge.get(url);
+            int idx = resp.indexOf('|');
+            String body = idx >= 0 ? resp.substring(idx + 1) : "";
+            JSONObject jo = new JSONObject(body);
+            int iret = jo.optInt("iretcode", -1);
+            if (iret != 0) { jlog("IRET " + ch[1] + "=" + iret + " body=" + body.substring(0, Math.min(80,body.length()))); return null; }
+            String pu = jo.optString("playurl", "");
+            pu = pu.trim();
+            if (!pu.startsWith("http://") && !pu.startsWith("https://")) {
+                jlog("BAD_PU " + ch[1] + " len=" + pu.length() + " head=" + pu.substring(0, Math.min(30,pu.length())));
+                return null;
+            }
+            jlog("OK_PU " + ch[1] + " " + pu.length());
+            return pu;
+        } catch (Throwable t) { return null; }
     }
 
     @Override
     public String liveContent(String url) throws Exception {
         try {
-            long tick = System.currentTimeMillis() / 1000;
-            String ck = CKey.INSTANCE.generate(tick, "2024078201");
-            String guid = CKey.INSTANCE.getGUID();
-            String est = CKey.INSTANCE.estId();
-            String flowid = java.util.UUID.randomUUID().toString() + "_" + tick + "_4330303";
-            String rand = String.valueOf(Math.random());
-            String liveUrl = LIVEINFO
-                + "&cKey=" + ck
-                + "&fntick=" + tick
-                + "&guid=" + guid
-                + "&estid=" + URLEncoder.encode(est, "UTF-8")
-                + "&flowid=" + flowid
-                + "&randnum=" + rand;
-            String resp = NetBridge.get(liveUrl);
-            int idx = resp.indexOf('|');
-            String body = idx >= 0 ? resp.substring(idx + 1) : "";
-            JSONObject jo = new JSONObject(body);
-            String pu = jo.optString("playurl", "");
-            if (pu.isEmpty()) return "#EXTM3U\n";
-            return "#EXTM3U\n#EXTINF:-1,CCTV1\n" + pu + "\n";
+            final long tick = System.currentTimeMillis() / 1000;
+            final String guid = CKey.INSTANCE.getGUID();
+            final String est = CKey.INSTANCE.estId();
+            StringBuilder sb = new StringBuilder("#EXTM3U\n");
+            int ok = 0;
+            jlog("LIVE start channels=" + CHANNELS.length + " tick=" + tick);
+            for (int i = 0; i < CHANNELS.length; i++) {
+                String[] ch = CHANNELS[i];
+                String pu = channelPlayurl(ch, tick, guid, est);
+                if (pu != null) {
+                    sb.append("#EXTINF:-1,").append(ch[0]).append("$").append(ch[1]).append("\n").append(pu).append("\n");
+                    ok++;
+                }
+            }
+            jlog("LIVE channels ok=" + ok + "/" + CHANNELS.length);
+            return sb.toString();
         } catch (Throwable t) {
             java.io.StringWriter sw = new java.io.StringWriter();
             t.printStackTrace(new java.io.PrintWriter(sw));

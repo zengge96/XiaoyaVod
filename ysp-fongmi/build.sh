@@ -12,7 +12,7 @@ D8="${ANDROID_HOME}/build-tools/34.0.0/d8"
 
 echo "=== 1. 编译 Java ==="
 rm -rf build/yclass && mkdir -p build/yclass
-javac -source 8 -target 8 -cp "$ANDROID_JAR:stubs" -d build/yclass \
+javac -encoding UTF-8 -source 8 -target 8 -cp "$ANDROID_JAR:stubs" -d build/yclass \
   stubs/com/github/catvod/crawler/Spider.java \
   java/com/ysp/svc/NetBridge.java \
   java/com/github/catvod/spider/Ysp.java

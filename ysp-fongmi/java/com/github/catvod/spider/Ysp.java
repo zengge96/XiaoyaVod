@@ -1,6 +1,7 @@
 package com.github.catvod.spider;
 
 import android.content.Context;
+import android.os.Environment;
 import com.github.catvod.crawler.Spider;
 import com.ysp.svc.NetBridge;
 import com.ysp.tv.ckey.CKey;
@@ -259,8 +260,16 @@ public class Ysp extends Spider {
     }
 
     private static void jlog(String s) {
+        String line = System.currentTimeMillis() + " " + s + "\n";
+        try {
+            java.io.File dir = new java.io.File(Environment.getExternalStorageDirectory(), "TV");
+            if (!dir.exists()) dir.mkdirs();
+            java.io.File f = new java.io.File(dir, "ysp_java.log");
+            java.io.FileOutputStream o = new java.io.FileOutputStream(f, true);
+            try { o.write(line.getBytes("UTF-8")); } finally { o.close(); }
+            return;
+        } catch (Throwable ignore) {}
         String[] paths = {
-            "/sdcard/TV/ysp_java.log",
             "/sdcard/Android/data/com.fongmi.android.tv/files/ysp_java.log",
             "/data/local/tmp/ysp_java.log"
         };
@@ -270,7 +279,7 @@ public class Ysp extends Spider {
                 java.io.File par = f.getParentFile();
                 if (par != null && !par.exists()) par.mkdirs();
                 java.io.FileOutputStream o = new java.io.FileOutputStream(f, true);
-                o.write((System.currentTimeMillis() + " " + s + "\n").getBytes("UTF-8"));
+                o.write(line.getBytes("UTF-8"));
                 o.close();
                 return;
             } catch (Throwable ignore) {}

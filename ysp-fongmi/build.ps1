@@ -14,7 +14,7 @@ if (-not (Test-Path $D8)) { throw "缺少 $D8" }
 Write-Host "=== 1. 编译 Java（JDK 11, source/target 8） ==="
 Remove-Item -Recurse -Force build\yclass -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path build\yclass | Out-Null
-& javac -source 8 -target 8 -cp "$ANDROID_JAR;stubs" -d build\yclass `
+& javac -encoding UTF-8 -source 8 -target 8 -cp "$ANDROID_JAR;stubs" -d build\yclass `
   "stubs\com\github\catvod\crawler\Spider.java" `
   "stubs\com\ysp\tv\player\CctvDrmSegmentDecryptor.java" `
   "java\com\ysp\svc\NetBridge.java" `

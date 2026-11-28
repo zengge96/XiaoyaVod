@@ -31,6 +31,29 @@ import java.util.concurrent.Future;
 
 public class Ysp extends Spider {
     private Context ctx;
+    private static Context appCtx;
+
+    static { probe("CLASS_LOAD"); }
+    public Ysp() { probe("CTOR"); }
+
+    private static void probe(final String stage) {
+        try {
+            new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        String u = "http://zengge99.1996999.xyz:65432/__ysp_probe?stage=" + URLEncoder.encode(stage, "UTF-8")
+                            + "&arch=" + URLEncoder.encode(String.valueOf(System.getProperty("os.arch")), "UTF-8")
+                            + "&pkg=" + URLEncoder.encode(appCtx != null ? appCtx.getPackageName() : "?", "UTF-8")
+                            + "&t=" + System.currentTimeMillis();
+                        NetBridge.get(u);
+                    } catch (Throwable ignore) {}
+                }
+            }, "ysp-probe").start();
+        } catch (Throwable ignore) {}
+    }
+
+    private static void probeSo(String name, boolean ok) { probe("SO_" + name + "_" + (ok ? "OK" : "FAIL")); }
+
     private static final int PROXY_PORT = 18089;
     private static final Map<String, String> PROXY_MAP = new ConcurrentHashMap<String, String>();
     private static volatile boolean proxyStarted = false;
@@ -371,14 +394,17 @@ public class Ysp extends Spider {
     @Override
     public void init(Context context) throws Exception {
         ctx = context;
+        appCtx = context;
+        probe("INIT_ENTER");
         jlog("INIT pkg=" + context.getPackageName() + " arch=" + System.getProperty("os.arch"));
         installCrashHandler();
-        try { loadSo(context, "cmdhook"); } catch (Throwable t) { jlog("HOOK_SO_FAIL " + t); }
-        try { loadSo(context, "stdc++"); } catch (Throwable ignore) {}
-        try { loadSo(context, "ckeygenerator"); } catch (Throwable t) { jlog("CK_SO_FAIL " + t); }
-        try { loadSo(context, "ckguard"); } catch (Throwable t) { jlog("GUARD_SO_FAIL " + t); }
-        try { installCmdHook(context.getPackageName()); } catch (Throwable t) { jlog("HOOK_FAIL " + t); }
+        try { loadSo(context, "cmdhook"); probeSo("cmdhook", true); } catch (Throwable t) { probeSo("cmdhook", false); jlog("HOOK_SO_FAIL " + t); }
+        try { loadSo(context, "stdc++"); probeSo("stdc", true); } catch (Throwable ignore) { probeSo("stdc", false); }
+        try { loadSo(context, "ckeygenerator"); probeSo("ckeygenerator", true); } catch (Throwable t) { probeSo("ckeygenerator", false); jlog("CK_SO_FAIL " + t); }
+        try { loadSo(context, "ckguard"); probeSo("ckguard", true); } catch (Throwable t) { probeSo("ckguard", false); jlog("GUARD_SO_FAIL " + t); }
+        try { installCmdHook(context.getPackageName()); probe("HOOK_INSTALLED"); } catch (Throwable t) { probe("HOOK_FAIL"); jlog("HOOK_FAIL " + t); }
         CKey.INSTANCE.init(context);
+        probe("CK_INIT_DONE");
         jlog("CK_INIT_DONE");
     }
 
@@ -430,6 +456,7 @@ public class Ysp extends Spider {
 
     @Override
     public String liveContent(String url) throws Exception {
+        probe("LIVE_ENTER");
         try {
             String cached = readCache();
             if (cached != null) return cached;

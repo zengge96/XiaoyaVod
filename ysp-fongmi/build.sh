@@ -32,6 +32,9 @@ cp prebuilt/armeabi-v7a/*.so build/jarout/lib/armeabi-v7a/
 cp prebuilt/arm64-v8a/*.so build/jarout/lib/arm64-v8a/
 ( cd build/jarout && zip -q -0 ../../ysp_spider.jar classes.dex lib/armeabi-v7a/*.so lib/arm64-v8a/*.so )
 
+echo "=== 4. 生成 md5 ==="
+md5sum "$ROOT/ysp_spider.jar" | cut -d' ' -f1 | tr -d '\n' > "$ROOT/ysp_spider.jar.md5"
+
 echo "=== 完成 ==="
-echo "产物: $ROOT/ysp_spider.jar"
-md5sum "$ROOT/ysp_spider.jar"
+echo "产物: $ROOT/ysp_spider.jar / ysp_spider.jar.md5"
+cat "$ROOT/ysp_spider.jar.md5"; echo
